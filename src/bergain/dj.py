@@ -1,11 +1,13 @@
 """
 DSPy RLM-powered streaming DJ.
 
-The RLM selects a palette from a pre-built role map, writes its own
-DJ loop, and streams audio in real-time through custom tool functions.
+The RLM writes its own DJ loop in a sandboxed REPL, driving audio output
+through tool functions. Palette is pre-loaded; the RLM focuses on rendering
+bars and evolving the set.
 """
 
 import json
+import random
 import signal
 import sys
 from collections import defaultdict
@@ -17,7 +19,10 @@ from bergain.indexer import build_index
 from bergain.renderer import load_palette, render_bar
 from bergain.streamer import AudioStreamer
 
+DEFAULT_ROLES = ["kick", "hihat", "bassline", "perc", "texture", "clap"]
+
 CRITIQUE_INTERVAL = 16  # bars between trajectory checks
+LLM_CRITIC_INTERVAL = 32  # bars between LLM critic calls
 MAX_LAYERS = 6  # auto-enforced density ceiling
 GAIN_CAP = {"texture": 0.55, "synth": 0.50}  # auto-enforced gain caps
 
@@ -74,6 +79,15 @@ def _build_role_map(index: list[dict]) -> dict[str, list[dict]]:
             role_map[role].append(entry)
 
     return dict(role_map)
+
+
+def _pick_random_palette(role_map: dict[str, list[dict]]) -> dict[str, str]:
+    """Pick one random sample per default role from the role map."""
+    palette = {}
+    for role in DEFAULT_ROLES:
+        if role in role_map and role_map[role]:
+            palette[role] = random.choice(role_map[role])["path"]
+    return palette
 
 
 def _auto_correct_bar(bar_spec: dict) -> tuple[dict, list[str]]:
@@ -165,48 +179,64 @@ def _compute_critique(history: list[dict]) -> str | None:
     return " | ".join(observations)
 
 
+def _llm_critique(history: list[dict], lm: dspy.LM) -> str | None:
+    """Ask an LM to critique the recent DJ set."""
+    window = min(LLM_CRITIC_INTERVAL, len(history))
+    if window < 16:
+        return None
+
+    recent = history[-window:]
+
+    # Build compact summary for the critic
+    energies = [
+        round(sum(ly.get("gain", 0.5) for ly in b.get("layers", [])), 2) for b in recent
+    ]
+    # Role usage across the window
+    role_counts: dict[str, int] = {}
+    for bar in recent:
+        for layer in bar.get("layers", []):
+            role_counts[layer["role"]] = role_counts.get(layer["role"], 0) + 1
+    # Last 4 bars as concrete examples
+    last_4 = json.dumps(recent[-4:], indent=1)
+
+    prompt = f"""\
+You are a Berghain resident DJ reviewing a set in progress ({window} bars so far).
+
+Energy per bar: {energies}
+Role usage: {json.dumps(role_counts)}
+Last 4 bars: {last_4}
+
+In 1-2 sentences, give ONE specific creative direction for the next section.
+Focus on musicality — what would make a dancer feel something new?
+Do NOT suggest mechanical fixes (gain values, layer counts). Think like an artist."""
+
+    try:
+        response = lm(prompt, temperature=0.9)
+        # dspy.LM may return list of strings or list of dicts
+        item = response[0] if isinstance(response, list) else response
+        if isinstance(item, dict):
+            text = item.get("content") or item.get("text") or str(item)
+        else:
+            text = str(item)
+        text = text.strip()
+        if len(text) > 300:
+            text = text[:297] + "..."
+        return text
+    except Exception as e:
+        print(f"  >> LLM critic error: {e}")
+        return None
+
+
 DJ_SIGNATURE = "sample_menu -> final_status"
 
 DJ_INSTRUCTIONS = """\
 You are a Berghain techno DJ streaming audio bar-by-bar in real-time.
 
-`sample_menu` is a JSON dict mapping roles to available samples:
-```json
-{"kick": [{"path":"...","name":"...","loop":false,"dur":0.9}, ...], ...}
-```
+A palette of samples is already loaded. Start rendering bars immediately
+in your FIRST code block — no setup needed.
 
-Available roles: kick, hihat, clap, bassline, perc, synth, texture, fx,
-drum_loop, hat_loop.
-
-------------------------------------------------------------------------
-
-# Step 1: Pick Palette and Render Immediately
-
-In your FIRST code block:
-
-1. Parse `sample_menu` (it's a JSON string)
-2. Pick ONE sample path per role you want to use
-3. Call `set_palette(json.dumps({"kick":"path","hihat":"path",...}))`
-4. Immediately render at least 32 bars
-
-Example palette pick (adapt to actual paths):
-```python
-import json
-menu = json.loads(sample_menu)
-palette = {
-    "kick": menu["kick"][0]["path"],
-    "hihat": menu["hihat"][2]["path"],
-    "bassline": menu["bassline"][0]["path"],
-    "perc": menu["perc"][3]["path"],
-    "texture": menu["texture"][1]["path"],
-    "fx": menu["fx"][0]["path"],
-}
-set_palette(json.dumps(palette))
-```
-
-Do NOT write helper functions. Do NOT print commentary. Pick and render.
-
-------------------------------------------------------------------------
+`sample_menu` is a JSON dict of ALL available samples by role. You only
+need it if you want to swap a sample later via `swap_sample()`.
 
 # Bar Spec Format
 
@@ -218,83 +248,53 @@ Do NOT write helper functions. Do NOT print commentary. Pick and render.
 - `"loop"`: stretches/loops sample across the full bar
 - `"gain"`: 0.0 to 1.0 (texture/synth auto-capped at 0.55/0.50)
 
-------------------------------------------------------------------------
+# Sound Design
 
-# Sound Design Guidelines
+Think Berghain — GROOVE, WEIGHT, ATMOSPHERE.
 
-Think like a Berghain DJ — the goal is GROOVE, WEIGHT, and ATMOSPHERE.
+Gain staging:
+- Kick: 0.90-0.95, 4-on-floor [0,1,2,3] — ALWAYS
+- Hihat: 0.50-0.65 — offbeat [0.5,1.5,2.5,3.5] or 16ths for intensity
+- Bassline: 0.60-0.75 — deep and present
+- Perc: 0.35-0.50 — syncopated [1.5], [2.5], [1,3], [0.5,2.5]
+- Texture: 0.30-0.50 — atmosphere, use type "loop"
+- Clap: 0.40-0.55 — on [1] or [1,3], NOT every beat
 
-## Gain staging (make it punch)
-- Kick: 0.90-0.95, 4-on-floor [0,1,2,3] — ALWAYS (this is techno)
-- Hihat: 0.50-0.65 (clearly audible motor, not buried)
-- Bassline: 0.60-0.75 (deep and present)
-- Perc: 0.35-0.50 (rhythmic accent, not ghost)
-- Texture: 0.30-0.50 (wash of atmosphere)
-- Synth: 0.25-0.45 (textural bed)
-- Clap: 0.40-0.55 (snappy backbeat when used)
-- FX: 0.30-0.45 (transition marker)
+Intro (first 16 bars): build from kick alone → add hat → bassline → full groove.
+Body: full groove with slow evolution over 32-bar arcs.
+Outro (last 16 bars): strip layers back to kick alone.
 
-## Rhythmic interest
-- Hats: use offbeat patterns [0.5,1.5,2.5,3.5] for drive,
-  or 16th-note [0,0.5,1,1.5,2,2.5,3,3.5] for intensity
-- Perc: place on syncopated beats like [1.5], [2.5], [1,3], [0.5,2.5]
-- Clap: on [1] or [1,3] for backbeat, NOT on every beat
-- Layer two rhythmic elements with complementary patterns
+Keep hats/perc at AUDIBLE gains (0.4+), at least 3-4 layers at peak moments.
 
-## Set structure (intro → body → outro)
+# Evolution
 
-**Intro (first 16 bars):** Build up from almost nothing.
-- Bars 1-4: kick alone (or kick + sparse hat)
-- Bars 5-8: add hat motor, maybe ghost perc
-- Bars 9-12: bring in bassline
-- Bars 13-16: add texture/perc — groove is now locked
+Berghain pacing: changes happen SLOWLY. Ride a groove for 32+ bars.
 
-**Body (middle bars):** Full groove with evolution.
-Use 8-bar phrases within 32-bar macro blocks:
-- Bars 1-8: locked groove (kick + hat + bass)
-- Bars 9-16: add perc, texture starts building
-- Bars 17-24: full energy — all layers present, higher gains
-- Bars 25-32: brief 2-4 bar dip (drop texture/perc), then rebuild
+Each iteration: render 16 bars. You do NOT have to change something every
+iteration — sometimes hold the groove and let it breathe.
 
-**Outro (last 16 bars):** Wind down by stripping layers.
-- Remove texture/synth first
-- Then drop perc
-- Then thin out hats
-- Last 4 bars: kick alone or kick + minimal hat, fading gain
+When you DO evolve (every 2-3 iterations), pick ONE subtle move:
+- Shift a gain to reshape energy
+- Move a perc hit to a different beat position
+- Swap a sample: parse `sample_menu` to find a path, then call
+  `swap_sample(json.dumps({"role":"hihat","path":"sample_pack/..."}))`
+- 2-4 bar subtractive moment (drop a layer) then restore
 
-## What makes it NOT dull
-- Hats and perc at AUDIBLE gains (0.4-0.6), not ghosted at 0.15
-- At least 3-4 layers active at peak moments
-- Texture/atmosphere actually present, not barely perceptible
-- Occasional rhythmic variation (shift perc beats every 8 bars)
-- Use hat_loop or drum_loop roles for pre-made rhythmic texture
+Bigger structural changes (new role, different bassline) every 48-64 bars.
 
-------------------------------------------------------------------------
+# Feedback
 
-# Subsequent Iterations
+Every bar, `render_and_play_bar()` returns bar count and buffer depth.
+Every 16 bars: TRAJECTORY feedback (energy direction, density, repetition).
+Every 32 bars: CRITIC feedback (qualitative creative direction from a
+resident DJ perspective). Prioritize CRITIC over TRAJECTORY when they conflict.
 
-Your REPL state persists. All variables from iteration 1 are in scope.
-Do NOT reparse sample_menu or call set_palette again.
-
-Each iteration: render at least 32 bars with ONE evolutionary change:
-- Swap hat pattern (offbeat → 16ths, or thin out)
-- Add/remove a layer
-- Shift gains for a new energy plateau
-- Change perc beat placement
-- 2-4 bar subtractive moment then restore
-
-Read TRAJECTORY feedback from render responses — it tells you about
-energy direction and mix state. Use it to decide your next move.
-
-------------------------------------------------------------------------
-
-# Hard Constraints
+# Constraints
 
 - `render_and_play_bar()` blocks — this IS your clock
 - Do NOT add `time.sleep()`
 - Do NOT spend iterations without rendering
-- Do NOT reparse sample_menu after iteration 1
-- Do NOT use `globals().get()` — variables persist directly
+- Variables persist between iterations — do NOT redeclare them
 - Call `SUBMIT("done")` only when stopping
 """
 
@@ -307,10 +307,14 @@ def run_dj(
     verbose: bool = False,
     output: str | None = None,
     max_bars: int | None = None,
+    critic_lm: str | None = None,
+    palette_file: str | None = None,
 ) -> None:
     """Build tools, configure DSPy, invoke RLM, handle shutdown."""
     load_dotenv()
-    dspy.configure(lm=dspy.LM(lm))
+    main_lm = dspy.LM(lm)
+    cheap_lm = dspy.LM(critic_lm) if critic_lm else main_lm
+    dspy.configure(lm=main_lm)
 
     print(f"Indexing samples from {sample_dir}...")
     index = build_index(sample_dir)
@@ -319,6 +323,14 @@ def run_dj(
     print(f"Indexed {len(index)} samples into {len(role_map)} roles:")
     for role, samples in role_map.items():
         print(f"  {role}: {len(samples)} samples")
+
+    # Always pre-load a palette: from file or randomly generated
+    if palette_file:
+        with open(palette_file) as f:
+            palette = json.load(f)
+    else:
+        palette = _pick_random_palette(role_map)
+    print(f"Palette: { {r: p.split('/')[-1] for r, p in palette.items()} }")
 
     if output:
         from bergain.streamer import FileWriter
@@ -333,30 +345,29 @@ def run_dj(
         print(f"Audio streamer started (BPM={bpm}, SR={sample_rate})")
 
     # Shared mutable state for closures
-    loaded_samples: dict = {}
+    loaded_samples = load_palette(palette, sample_rate)
     bars_played = [0]
     bar_history: list[dict] = []
 
     # --- RLM Tool Functions (closures over shared state) ---
 
-    def set_palette(palette_json: str) -> str:
-        """Load samples for the given palette. Call once before rendering.
-        Input: JSON {"kick": "path/to/kick.wav", "hihat": "path/to/hihat.wav", ...}
+    def swap_sample(swap_json: str) -> str:
+        """Swap a single sample in the palette without affecting other roles.
+        Input: JSON {"role": "hihat", "path": "sample_pack/hihat/HH_02.wav"}
         """
-        nonlocal loaded_samples
-        palette = json.loads(palette_json)
-        loaded_samples = load_palette(palette, sample_rate)
-        roles = list(loaded_samples.keys())
-        print(f"  Palette loaded: {roles}")
-        return f"Loaded {len(loaded_samples)} samples: {roles}"
+        spec = json.loads(swap_json)
+        role = spec["role"]
+        path = spec["path"]
+        from pydub import AudioSegment
+
+        seg = AudioSegment.from_file(path).set_channels(1).set_frame_rate(sample_rate)
+        loaded_samples[role] = seg
+        print(f"  Swapped {role} -> {path.split('/')[-1]}")
+        return f"Swapped {role}. Active roles: {list(loaded_samples.keys())}"
 
     def render_and_play_bar(bar_spec_json: str) -> str:
         """Render one bar of audio and stream it. Blocks until buffer has space.
         Input: JSON {"layers": [{"role":"kick","type":"oneshot","beats":[0,2],"gain":0.9}, ...]}
-
-        Mechanical guardrails (gain caps, density limits) are auto-applied.
-        Every 16 bars, a trajectory observation is appended — use it to guide
-        your creative decisions (you do NOT need to parse or regex-match it).
         """
         bar_spec = json.loads(bar_spec_json)
 
@@ -380,6 +391,11 @@ def run_dj(
             if critique:
                 result += f"\nTRAJECTORY: {critique}"
                 print(f"  >> TRAJECTORY: {critique}")
+        if bars_played[0] % LLM_CRITIC_INTERVAL == 0:
+            llm_feedback = _llm_critique(bar_history, cheap_lm)
+            if llm_feedback:
+                result += f"\nCRITIC: {llm_feedback}"
+                print(f"  >> CRITIC: {llm_feedback}")
         if max_bars and bars_played[0] >= max_bars:
             print(f"\nReached {max_bars}-bar limit. Draining buffer...")
             if hasattr(streamer, "drain"):
@@ -390,15 +406,6 @@ def run_dj(
 
             os._exit(0)
         return result
-
-    def get_status() -> str:
-        """Get current playback status.
-        Returns a plain string like: "bars_played=160 buffer=12/64"
-        """
-        return (
-            f"bars_played={bars_played[0]} "
-            f"buffer={streamer.buffer_bars}/{streamer.audio_queue.maxsize}"
-        )
 
     def get_history(last_n: str = "32") -> str:
         """Get a summary of recent DJ history.
@@ -448,13 +455,16 @@ def run_dj(
         print(f"Will stop after {max_bars} bars.")
     print("Press Ctrl+C to stop.\n")
 
-    signature = dspy.Signature(DJ_SIGNATURE, instructions=DJ_INSTRUCTIONS)
+    instructions = DJ_INSTRUCTIONS + (f"\nLoaded roles: {list(loaded_samples.keys())}")
+
+    signature = dspy.Signature(DJ_SIGNATURE, instructions=instructions)
     rlm = dspy.RLM(
         signature,
-        tools=[set_palette, render_and_play_bar, get_status, get_history],
+        tools=[swap_sample, render_and_play_bar, get_history],
         max_iterations=100,
         max_llm_calls=500,
         verbose=verbose,
+        sub_lm=cheap_lm,
     )
 
     try:

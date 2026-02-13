@@ -93,7 +93,17 @@ def play(file):
     default=None,
     help="Stop after this many bars (default: run until interrupted).",
 )
-def dj(sample_dir, bpm, lm, verbose, output, bars):
+@click.option(
+    "--critic-lm",
+    default=None,
+    help="Cheap LM for critic feedback (default: same as --lm).",
+)
+@click.option(
+    "--palette",
+    default=None,
+    help="JSON file with pre-selected palette (role→path map). Skips palette selection.",
+)
+def dj(sample_dir, bpm, lm, verbose, output, bars, critic_lm, palette):
     """Start a streaming DJ set powered by DSPy RLM."""
     from bergain.dj import run_dj
 
@@ -104,4 +114,6 @@ def dj(sample_dir, bpm, lm, verbose, output, bars):
         verbose=verbose,
         output=output,
         max_bars=bars,
+        critic_lm=critic_lm,
+        palette_file=palette,
     )
