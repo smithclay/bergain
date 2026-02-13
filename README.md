@@ -12,7 +12,7 @@ RLMs flip this. The model gets a persistent REPL — a sandbox where variables, 
 
 - **The REPL is the DJ's brain.** It writes `for bar in range(64)` and that loop *runs*, calling `render_and_play_bar()` 64 times. Each call blocks until the audio buffer has space, so the model is naturally paced at playback speed.
 - **Tools are the DJ's hands.** `set_palette()`, `render_and_play_bar()`, `get_history()` are Python closures over shared state — loaded samples, the audio streamer, bar history. The RLM calls them as regular functions inside its own code.
-- **State accumulates.** The RLM can define helper functions, store patterns in variables, and build on previous iterations. It doesn't start from scratch each turn — it *evolves*.
+- **State accumulates.** The RLM can build on previous iterations. It doesn't start from scratch each turn — it *evolves*.
 - **Backpressure is the clock.** `render_and_play_bar()` blocks when the audio queue is full. No `time.sleep()`, no scheduling logic. The buffer *is* the tempo.
 
 The result: the RLM doesn't just pick samples and hand them off. It writes a DJ set as a program that runs in real-time, with the model reasoning about structure, density, and energy trajectory as it goes.

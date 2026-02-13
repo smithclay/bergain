@@ -87,8 +87,21 @@ def play(file):
     default=None,
     help="Write to WAV file instead of streaming to speakers.",
 )
-def dj(sample_dir, bpm, lm, verbose, output):
+@click.option(
+    "--bars",
+    type=int,
+    default=None,
+    help="Stop after this many bars (default: run until interrupted).",
+)
+def dj(sample_dir, bpm, lm, verbose, output, bars):
     """Start a streaming DJ set powered by DSPy RLM."""
     from bergain.dj import run_dj
 
-    run_dj(sample_dir=sample_dir, bpm=bpm, lm=lm, verbose=verbose, output=output)
+    run_dj(
+        sample_dir=sample_dir,
+        bpm=bpm,
+        lm=lm,
+        verbose=verbose,
+        output=output,
+        max_bars=bars,
+    )

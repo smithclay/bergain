@@ -61,6 +61,7 @@ class AudioStreamer:
                 break
             self._stream.write(chunk)
             self.buffer_bars = max(0, self.buffer_bars - 1)
+            self.audio_queue.task_done()
 
     def enqueue(self, audio: AudioSegment) -> None:
         """Convert AudioSegment to numpy and enqueue. Blocks when queue is full."""
@@ -72,6 +73,10 @@ class AudioStreamer:
                 return
             except queue.Full:
                 continue
+
+    def drain(self) -> None:
+        """Block until the audio queue is empty (all bars played)."""
+        self.audio_queue.join()
 
     def stop(self) -> None:
         """Graceful shutdown: drain queue then stop."""

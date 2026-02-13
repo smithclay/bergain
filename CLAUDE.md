@@ -47,6 +47,8 @@ The `dj` command replaces the static recipe with a DSPy RLM invocation. The RLM'
 Key mechanisms:
 - **Tools as closures** — `set_palette()`, `render_and_play_bar()`, `get_status()`, `get_history()` are closures over shared state (loaded samples, audio streamer, bar history)
 - **Backpressure** — `render_and_play_bar()` blocks when the audio queue is full, naturally pacing the RLM at playback speed
+- **Auto-guardrails** — `render_and_play_bar()` auto-caps texture/synth gains and trims density before rendering, so the RLM doesn't waste tokens on mechanical fixes
+- **Trajectory feedback** — every 16 bars, trajectory observations (energy slope, stagnation, density) are pushed to the RLM as creative guidance it can reason about
 - **Self-reflection** — the RLM periodically calls `get_history()` + `llm_query()` within its loop to get creative direction and evolve patterns
 - **Deno sandbox** — DSPy's PythonInterpreter runs code in Deno+Pyodide; tool functions execute on the host where pydub/sounddevice live
 
