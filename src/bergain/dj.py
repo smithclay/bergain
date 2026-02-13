@@ -23,34 +23,47 @@ DEFAULT_ROLES = ["kick", "hihat", "bassline", "perc", "texture", "clap"]
 
 CRITIQUE_INTERVAL = 8  # bars between trajectory checks
 LLM_CRITIC_INTERVAL = 16  # bars between LLM critic calls
-MAX_LAYERS = 6  # auto-enforced density ceiling (flat fallback)
 GAIN_CAP = {"texture": 0.55, "synth": 0.50}  # auto-enforced gain caps
 
 ENERGY_CURVE = [0.25, 0.50, 0.75, 0.90, 0.90, 0.85, 0.60, 0.30]
+
+# Structural arc phases: (threshold, layer_cap, phase_name)
+# Thresholds are fractions of total bars; first matching threshold wins.
+_ARC_PHASES = [
+    (0.125, 2, "intro phase"),
+    (0.25, 4, "building phase"),
+    (0.75, 6, "full groove phase"),
+    (0.875, 4, "stripping phase"),
+    (1.1, 2, "outro phase"),
+]
+_DEFAULT_CAP = 6  # infinite mode: flat cap
 
 
 def _max_layers_at(bar: int, total: int | None) -> int:
     """Progressive density cap: intro -> peak -> outro."""
     if total is None:
-        return 6  # infinite mode: flat cap
+        return _DEFAULT_CAP
     pct = bar / max(total, 1)
-    if pct < 0.125:
-        return 2  # bars 1-8: kick + one
-    elif pct < 0.25:
-        return 4  # bars 9-16: building
-    elif pct < 0.75:
-        return 6  # bars 17-48: full groove
-    elif pct < 0.875:
-        return 4  # bars 49-56: stripping
-    else:
-        return 2  # bars 57-64: outro
+    for threshold, cap, _ in _ARC_PHASES:
+        if pct < threshold:
+            return cap
+    return 2
+
+
+def _phase_name_at(bar: int, total: int) -> str:
+    """Return the structural phase name at a bar position."""
+    pct = bar / max(total, 1)
+    for threshold, _, name in _ARC_PHASES:
+        if pct < threshold:
+            return name
+    return "outro phase"
 
 
 def _target_energy(bar: int, total: int | None) -> float:
-    """Target energy at this bar position."""
+    """Target energy at this bar position (0-1 normalized scale)."""
     if total is None:
         return 0.80
-    segment = min(int(bar / total * len(ENERGY_CURVE)), len(ENERGY_CURVE) - 1)
+    segment = min(int(bar / max(total, 1) * len(ENERGY_CURVE)), len(ENERGY_CURVE) - 1)
     return ENERGY_CURVE[segment]
 
 
@@ -144,20 +157,9 @@ def _auto_correct_bar(
             key=lambda ly: ly.get("gain", 0),
             reverse=True,
         )
-        layers = keep + rest[: cap - len(keep)]
-        # Determine phase name for the message
+        layers = keep + rest[: max(0, cap - len(keep))]
         if max_bars is not None:
-            pct = bars_played / max(max_bars, 1)
-            if pct < 0.125:
-                phase = "intro phase"
-            elif pct < 0.25:
-                phase = "building phase"
-            elif pct < 0.75:
-                phase = "full groove phase"
-            elif pct < 0.875:
-                phase = "stripping phase"
-            else:
-                phase = "outro phase"
+            phase = _phase_name_at(bars_played, max_bars)
             corrections.append(f"auto-trimmed to {len(layers)} layers ({phase})")
         else:
             corrections.append(f"auto-trimmed to {len(layers)} layers")
@@ -185,12 +187,15 @@ def _compute_critique(
     avg_second = sum(energies[half:]) / (len(energies) - half)
     slope = (avg_second - avg_first) / len(energies)
 
-    # Target energy comparison
+    # Target energy comparison (normalize sum-of-gains to 0-1 scale)
+    normalized_e = mean_e / _DEFAULT_CAP
     target = _target_energy(bar, total)
-    delta = mean_e - target
+    delta = normalized_e - target
     if abs(delta) > 0.15:
         direction = "strip back" if delta > 0 else "build up"
-        observations.append(f"energy: {mean_e:.2f}, target: {target:.2f} — {direction}")
+        observations.append(
+            f"energy: {normalized_e:.2f}, target: {target:.2f} — {direction}"
+        )
     elif slope > 0.05:
         observations.append(
             f"energy rising (+{slope:.3f}/bar) — consider a plateau or subtractive moment"
