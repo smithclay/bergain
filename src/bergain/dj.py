@@ -27,6 +27,17 @@ GAIN_CAP = {"texture": 0.55, "synth": 0.50}  # auto-enforced gain caps
 
 ENERGY_CURVE = [0.25, 0.50, 0.75, 0.90, 0.90, 0.85, 0.60, 0.30]
 
+BEAT_PATTERNS = {
+    "FOUR_ON_FLOOR": [0, 1, 2, 3],
+    "OFFBEAT_8THS": [0.5, 1.5, 2.5, 3.5],
+    "SYNCOPATED_A": [0.5, 2.5],
+    "SYNCOPATED_B": [1.5, 3.5],
+    "BACKBEAT": [1, 3],
+    "SPARSE_ACCENT": [1],
+    "GALLOP": [0, 0.5, 2, 2.5],
+    "16TH_DRIVE": [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5],
+}
+
 # Structural arc phases: (threshold, layer_cap, phase_name)
 # Thresholds are fractions of total bars; first matching threshold wins.
 _ARC_PHASES = [
@@ -329,6 +340,18 @@ Outro (last 16 bars): strip layers back to kick alone.
 
 Keep hats/perc at AUDIBLE gains (0.4+), at least 3-4 layers at peak moments.
 
+# Beat Patterns (use these names or raw arrays)
+FOUR_ON_FLOOR = [0,1,2,3]        # kick standard
+OFFBEAT_8THS  = [0.5,1.5,2.5,3.5] # classic hat
+SYNCOPATED_A  = [0.5, 2.5]        # minimal perc
+SYNCOPATED_B  = [1.5, 3.5]        # displaced feel
+BACKBEAT      = [1, 3]            # clap/snare standard
+SPARSE_ACCENT = [1]               # less-is-more
+GALLOP        = [0, 0.5, 2, 2.5]  # driving energy
+16TH_DRIVE    = [0,0.5,1,1.5,2,2.5,3,3.5]  # maximum intensity
+
+Variation idea: switch hihat from OFFBEAT_8THS to SYNCOPATED_A for 4 bars.
+
 # Evolution
 
 Berghain pacing: changes happen SLOWLY. Ride a groove for 32+ bars.
@@ -525,7 +548,11 @@ def run_dj(
         print(f"Will stop after {max_bars} bars.")
     print("Press Ctrl+C to stop.\n")
 
-    instructions = DJ_INSTRUCTIONS + (f"\nLoaded roles: {list(loaded_samples.keys())}")
+    pattern_vars = "\n".join(f"{k} = {v}" for k, v in BEAT_PATTERNS.items())
+    instructions = (
+        DJ_INSTRUCTIONS
+        + f"\nLoaded roles: {list(loaded_samples.keys())}\n\n# Available as variables:\n{pattern_vars}"
+    )
 
     signature = dspy.Signature(DJ_SIGNATURE, instructions=instructions)
     rlm = dspy.RLM(
