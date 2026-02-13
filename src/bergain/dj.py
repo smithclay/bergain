@@ -35,7 +35,7 @@ BEAT_PATTERNS = {
     "BACKBEAT": [1, 3],
     "SPARSE_ACCENT": [1],
     "GALLOP": [0, 0.5, 2, 2.5],
-    "16TH_DRIVE": [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5],
+    "SIXTEENTH_DRIVE": [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5],
 }
 
 # Structural arc phases: (threshold, layer_cap, phase_name)
@@ -348,7 +348,7 @@ SYNCOPATED_B  = [1.5, 3.5]        # displaced feel
 BACKBEAT      = [1, 3]            # clap/snare standard
 SPARSE_ACCENT = [1]               # less-is-more
 GALLOP        = [0, 0.5, 2, 2.5]  # driving energy
-16TH_DRIVE    = [0,0.5,1,1.5,2,2.5,3,3.5]  # maximum intensity
+SIXTEENTH_DRIVE    = [0,0.5,1,1.5,2,2.5,3,3.5]  # maximum intensity
 
 Variation idea: switch hihat from OFFBEAT_8THS to SYNCOPATED_A for 4 bars.
 
