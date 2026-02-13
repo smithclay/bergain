@@ -55,7 +55,12 @@ def generate_arrangement(sample_dir: str, seed: int | None = None) -> dict:
             "bars": 16,
             "layers": [
                 {"role": "kick", "type": "oneshot", "beats": [0, 1, 2, 3], "gain": 1.0},
-                {"role": "hihat", "type": "oneshot", "beats": [0, 1, 2, 3], "gain": 0.5},
+                {
+                    "role": "hihat",
+                    "type": "oneshot",
+                    "beats": [0, 1, 2, 3],
+                    "gain": 0.5,
+                },
                 {"role": "clap", "type": "oneshot", "beats": [1, 3], "gain": 0.7},
                 {"role": "bassline", "type": "loop", "gain": 0.7},
                 {"role": "drum_loop", "type": "loop", "gain": 0.4},
@@ -70,7 +75,14 @@ def generate_arrangement(sample_dir: str, seed: int | None = None) -> dict:
             "layers": [
                 {"role": "texture", "type": "loop", "gain": 0.4},
                 {"role": "synth", "type": "loop", "gain": 0.5},
-                {"role": "fx", "type": "oneshot", "beats": [0], "gain": 0.6, "start_bar": 4, "end_bar": 5},
+                {
+                    "role": "fx",
+                    "type": "oneshot",
+                    "beats": [0],
+                    "gain": 0.6,
+                    "start_bar": 4,
+                    "end_bar": 5,
+                },
             ],
             "fade_in": None,
             "fade_out": None,
@@ -80,7 +92,12 @@ def generate_arrangement(sample_dir: str, seed: int | None = None) -> dict:
             "bars": 16,
             "layers": [
                 {"role": "kick", "type": "oneshot", "beats": [0, 1, 2, 3], "gain": 1.0},
-                {"role": "hihat", "type": "oneshot", "beats": [0, 1, 2, 3], "gain": 0.5},
+                {
+                    "role": "hihat",
+                    "type": "oneshot",
+                    "beats": [0, 1, 2, 3],
+                    "gain": 0.5,
+                },
                 {"role": "clap", "type": "oneshot", "beats": [1, 3], "gain": 0.7},
                 {"role": "bassline", "type": "loop", "gain": 0.7},
                 {"role": "drum_loop", "type": "loop", "gain": 0.45},

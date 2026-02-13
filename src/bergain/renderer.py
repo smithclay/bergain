@@ -76,7 +76,9 @@ def render(arrangement: dict, output_wav_path: str) -> None:
                     for beat in beats:
                         pos_ms = int(bar * bar_ms + beat * beat_ms)
                         if pos_ms < section_ms:
-                            section_audio = section_audio.overlay(adjusted, position=pos_ms)
+                            section_audio = section_audio.overlay(
+                                adjusted, position=pos_ms
+                            )
 
         # Apply fades (specified in bars)
         fade_in_bars = section.get("fade_in")
@@ -104,7 +106,7 @@ def render(arrangement: dict, output_wav_path: str) -> None:
     song.export(str(out), format="wav")
 
     total_s = len(song) / 1000
-    print(f"Rendered {total_s:.1f}s ({total_s/60:.1f} min) -> {out}")
+    print(f"Rendered {total_s:.1f}s ({total_s / 60:.1f} min) -> {out}")
 
 
 def play(wav_path: str) -> None:

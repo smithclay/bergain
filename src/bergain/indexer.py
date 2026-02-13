@@ -2,7 +2,6 @@
 Sample pack indexer — scans audio files and extracts metadata via av.
 """
 
-import json
 import os
 import re
 from pathlib import Path
@@ -46,9 +45,7 @@ def get_audio_info(filepath: str) -> dict:
         with av.open(filepath) as container:
             stream = container.streams.audio[0]
             duration_s = (
-                float(stream.duration * stream.time_base)
-                if stream.duration
-                else None
+                float(stream.duration * stream.time_base) if stream.duration else None
             )
             if duration_s is None and container.duration:
                 duration_s = container.duration / av.time_base
@@ -58,7 +55,12 @@ def get_audio_info(filepath: str) -> dict:
                 "channels": stream.channels,
             }
     except Exception as e:
-        return {"duration_s": None, "sample_rate": None, "channels": None, "error": str(e)}
+        return {
+            "duration_s": None,
+            "sample_rate": None,
+            "channels": None,
+            "error": str(e),
+        }
 
 
 def build_index(sample_dir: str) -> list[dict]:
@@ -105,14 +107,16 @@ def build_index(sample_dir: str) -> list[dict]:
                 elif "shaker" in lower:
                     sub_type = "shaker"
 
-            samples.append({
-                "path": rel_path,
-                "filename": fname,
-                "category": category,
-                "sub_type": sub_type,
-                "is_loop": is_loop(fname, category),
-                "bpm": bpm,
-                **info,
-            })
+            samples.append(
+                {
+                    "path": rel_path,
+                    "filename": fname,
+                    "category": category,
+                    "sub_type": sub_type,
+                    "is_loop": is_loop(fname, category),
+                    "bpm": bpm,
+                    **info,
+                }
+            )
 
     return samples

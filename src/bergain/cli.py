@@ -14,8 +14,12 @@ def cli():
 
 
 @cli.command()
-@click.option("--sample-dir", default="sample_pack", help="Path to sample pack directory.")
-@click.option("--output", default="output/", help="Output directory for arrangement artifact.")
+@click.option(
+    "--sample-dir", default="sample_pack", help="Path to sample pack directory."
+)
+@click.option(
+    "--output", default="output/", help="Output directory for arrangement artifact."
+)
 @click.option("--seed", type=int, default=None, help="Random seed for reproducibility.")
 def generate(sample_dir, output, seed):
     """Generate a song arrangement artifact (JSON)."""
@@ -35,7 +39,7 @@ def generate(sample_dir, output, seed):
         f"{s['name']}({s['bars']})" for s in arrangement["sections"]
     )
     print(f"  Structure: {section_summary} = {total_bars} bars")
-    print(f"  Palette:")
+    print("  Palette:")
     for role, path in arrangement["palette"].items():
         print(f"    {role}: {Path(path).name}")
 
@@ -51,7 +55,9 @@ def play(file):
     if file is None:
         artifacts = sorted(Path("output").glob("song_*.json"))
         if not artifacts:
-            raise click.ClickException("No song artifacts found in output/. Run 'bergain generate' first.")
+            raise click.ClickException(
+                "No song artifacts found in output/. Run 'bergain generate' first."
+            )
         file = str(artifacts[-1])
         print(f"Using latest artifact: {file}")
 
