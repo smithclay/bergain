@@ -369,8 +369,8 @@ the groove and let it breathe.
 When you DO evolve (every 2-3 iterations), pick ONE subtle move:
 - Shift a gain to reshape energy
 - Move a perc hit to a different beat position
-- Swap a sample: parse `sample_menu` to find a path, then call
-  `swap_sample(json.dumps({"role":"hihat","path":"sample_pack/..."}))`
+- Swap a sample: call `list_alternatives("hihat")` to see options,
+  then `swap_sample("hihat", "3")` or `swap_sample("hihat", "random")`
 - 2-4 bar subtractive moment (drop a layer) then restore
 
 Bigger structural changes (new role, different bassline) every 48-64 bars.
@@ -446,19 +446,42 @@ def run_dj(
 
     # --- RLM Tool Functions (closures over shared state) ---
 
-    def swap_sample(swap_json: str) -> str:
-        """Swap a single sample in the palette without affecting other roles.
-        Input: JSON {"role": "hihat", "path": "sample_pack/hihat/HH_02.wav"}
-        """
-        spec = json.loads(swap_json)
-        role = spec["role"]
-        path = spec["path"]
+    def list_alternatives(role: str) -> str:
+        """List available alternative samples for a role.
+        Input: role name (e.g., "hihat")
+        Returns: numbered list of alternatives."""
+        alternatives = role_map.get(role, [])
+        current = palette.get(role, "")
+        lines = [f"Current {role}: {current.split('/')[-1]}"]
+        for i, s in enumerate(alternatives):
+            if s["path"] != current:
+                marker = " (loop)" if s.get("loop") else ""
+                lines.append(f"  {i}: {s['name']}{marker}")
+        return "\n".join(lines)
+
+    def swap_sample(role: str, index: str = "random") -> str:
+        """Swap a sample by role and index number.
+        Examples: swap_sample("hihat", "3") or swap_sample("perc", "random")"""
+        alternatives = role_map.get(role, [])
+        if not alternatives:
+            return f"No alternatives for {role}"
+        if index == "random":
+            choice = random.choice(alternatives)
+        else:
+            choice = alternatives[int(index)]
         from pydub import AudioSegment
 
-        seg = AudioSegment.from_file(path).set_channels(1).set_frame_rate(sample_rate)
+        seg = (
+            AudioSegment.from_file(choice["path"])
+            .set_channels(1)
+            .set_frame_rate(sample_rate)
+        )
         loaded_samples[role] = seg
-        print(f"  Swapped {role} -> {path.split('/')[-1]}")
-        return f"Swapped {role}. Active roles: {list(loaded_samples.keys())}"
+        palette[role] = choice["path"]
+        print(f"  Swapped {role} -> {choice['name']}")
+        return (
+            f"Swapped {role} to {choice['name']}. Active: {list(loaded_samples.keys())}"
+        )
 
     def render_and_play_bar(bar_spec_json: str) -> str:
         """Render one bar of audio and stream it. Blocks until buffer has space.
@@ -570,7 +593,13 @@ def run_dj(
     signature = dspy.Signature(DJ_SIGNATURE, instructions=instructions)
     rlm = dspy.RLM(
         signature,
-        tools=[swap_sample, render_and_play_bar, get_history, check_feedback],
+        tools=[
+            swap_sample,
+            render_and_play_bar,
+            get_history,
+            check_feedback,
+            list_alternatives,
+        ],
         max_iterations=100,
         max_llm_calls=500,
         verbose=verbose,
