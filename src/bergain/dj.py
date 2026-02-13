@@ -21,8 +21,8 @@ from bergain.streamer import AudioStreamer
 
 DEFAULT_ROLES = ["kick", "hihat", "bassline", "perc", "texture", "clap"]
 
-CRITIQUE_INTERVAL = 16  # bars between trajectory checks
-LLM_CRITIC_INTERVAL = 32  # bars between LLM critic calls
+CRITIQUE_INTERVAL = 8  # bars between trajectory checks
+LLM_CRITIC_INTERVAL = 16  # bars between LLM critic calls
 MAX_LAYERS = 6  # auto-enforced density ceiling
 GAIN_CAP = {"texture": 0.55, "synth": 0.50}  # auto-enforced gain caps
 
@@ -206,9 +206,13 @@ Energy per bar: {energies}
 Role usage: {json.dumps(role_counts)}
 Last 4 bars: {last_4}
 
-In 1-2 sentences, give ONE specific creative direction for the next section.
-Focus on musicality — what would make a dancer feel something new?
-Do NOT suggest mechanical fixes (gain values, layer counts). Think like an artist."""
+Give ONE specific, actionable direction for the next 8-16 bars.
+Express it as concrete actions the DJ can take:
+- Change a role's gain (e.g., "drop hihat gain to 0.3 for 8 bars")
+- Change beat positions (e.g., "move perc from backbeat to syncopated")
+- Swap a sample (e.g., "swap hihat for something brighter")
+- Add/remove a layer (e.g., "drop texture for 4 bars, then bring it back")
+Be specific about timing (how many bars) and which roles to change."""
 
     try:
         response = lm(prompt, temperature=0.9)
@@ -270,8 +274,15 @@ Keep hats/perc at AUDIBLE gains (0.4+), at least 3-4 layers at peak moments.
 
 Berghain pacing: changes happen SLOWLY. Ride a groove for 32+ bars.
 
-Each iteration: render 16 bars. You do NOT have to change something every
-iteration — sometimes hold the groove and let it breathe.
+Each iteration: render 8 bars, then review any feedback before continuing.
+Your loop should look like:
+    for i in range(8):
+        result = render_and_play_bar(...)
+    # After 8 bars: check result for TRAJECTORY/CRITIC feedback
+    # Make ONE subtle adjustment before the next 8-bar block
+
+You do NOT have to change something every iteration — sometimes hold
+the groove and let it breathe.
 
 When you DO evolve (every 2-3 iterations), pick ONE subtle move:
 - Shift a gain to reshape energy
@@ -285,9 +296,9 @@ Bigger structural changes (new role, different bassline) every 48-64 bars.
 # Feedback
 
 Every bar, `render_and_play_bar()` returns bar count and buffer depth.
-Every 16 bars: TRAJECTORY feedback (energy direction, density, repetition).
-Every 32 bars: CRITIC feedback (qualitative creative direction from a
-resident DJ perspective). Prioritize CRITIC over TRAJECTORY when they conflict.
+Every 8 bars: TRAJECTORY feedback (energy direction, density, repetition).
+Every 16 bars: CRITIC feedback (specific, actionable creative direction).
+Prioritize CRITIC over TRAJECTORY when they conflict.
 
 # Constraints
 
