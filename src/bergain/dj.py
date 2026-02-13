@@ -468,7 +468,13 @@ def run_dj(
         if index == "random":
             choice = random.choice(alternatives)
         else:
-            choice = alternatives[int(index)]
+            try:
+                idx = int(index)
+            except ValueError:
+                return f"Invalid index '{index}' — use a number or 'random'"
+            if idx < 0 or idx >= len(alternatives):
+                return f"Invalid index {idx} for {role} (0-{len(alternatives) - 1} available)"
+            choice = alternatives[idx]
         from pydub import AudioSegment
 
         seg = (
