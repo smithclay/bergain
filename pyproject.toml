@@ -1,0 +1,21 @@
+[project]
+name = "bergain"
+version = "0.1.0"
+description = "Recipe-based techno song builder"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "av>=16.1.0",
+    "click>=8.0",
+    "pydub>=0.25.1",
+]
+
+[project.scripts]
+bergain = "bergain.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bergain"]
