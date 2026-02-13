@@ -81,8 +81,14 @@ def play(file):
 @click.option("--bpm", type=int, default=128, help="Beats per minute.")
 @click.option("--lm", required=True, help="LiteLLM model ID, e.g. 'openai/gpt-4o'.")
 @click.option("--verbose", is_flag=True, help="Show RLM execution details.")
-def dj(sample_dir, bpm, lm, verbose):
+@click.option(
+    "--output",
+    "-o",
+    default=None,
+    help="Write to WAV file instead of streaming to speakers.",
+)
+def dj(sample_dir, bpm, lm, verbose, output):
     """Start a streaming DJ set powered by DSPy RLM."""
     from bergain.dj import run_dj
 
-    run_dj(sample_dir=sample_dir, bpm=bpm, lm=lm, verbose=verbose)
+    run_dj(sample_dir=sample_dir, bpm=bpm, lm=lm, verbose=verbose, output=output)

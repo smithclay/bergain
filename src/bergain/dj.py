@@ -16,89 +16,336 @@ from bergain.indexer import build_index
 from bergain.renderer import load_palette, render_bar
 from bergain.streamer import AudioStreamer
 
+CRITIQUE_INTERVAL = 16  # bars between critique checks
+
+
+def _compute_critique(history: list[dict]) -> str | None:
+    """Analyze recent bars and return a critique directive, or None if on track."""
+    window = min(CRITIQUE_INTERVAL, len(history))
+    if window < 8:
+        return None
+
+    recent = history[-window:]
+    issues: list[str] = []
+
+    # --- Density ---
+    densities = [len(b.get("layers", [])) for b in recent]
+    avg_density = sum(densities) / len(densities)
+    if avg_density > 5:
+        issues.append(f"OVER-DENSE avg={avg_density:.1f}/bar (want <5). Drop a layer.")
+    elif max(densities) > 6:
+        issues.append(f"DENSITY SPIKE {max(densities)} layers. Keep max <=5.")
+
+    # --- Energy trajectory ---
+    energies = [sum(ly.get("gain", 0.5) for ly in b.get("layers", [])) for b in recent]
+    mean_e = sum(energies) / len(energies)
+    half = len(energies) // 2
+    avg_first = sum(energies[:half]) / half
+    avg_second = sum(energies[half:]) / (len(energies) - half)
+    slope = (avg_second - avg_first) / len(energies)
+    if slope > 0.05:
+        issues.append(f"ENERGY RISING +{slope:.3f}/bar. Plateau or subtract.")
+    elif slope < -0.05:
+        issues.append(f"ENERGY DROPPING {slope:.3f}/bar. Stabilize.")
+
+    # Energy variance — low = hypnotic
+    variance = sum((e - mean_e) ** 2 for e in energies) / len(energies)
+    if variance > 0.5:
+        issues.append(f"ENERGY UNSTABLE var={variance:.2f}. Steady plateau needed.")
+
+    # --- Repetition ---
+    specs = [json.dumps(b, sort_keys=True) for b in recent]
+    unique_ratio = len(set(specs)) / len(specs)
+    if unique_ratio < 0.2:
+        issues.append("STAGNANT. Introduce micro-variation (gain shift, ghost note).")
+    elif unique_ratio > 0.9:
+        issues.append("TOO VARIED. Repeat patterns more — hypnotic = repetition.")
+
+    # --- Kick presence ---
+    kick_pct = sum(
+        1 for b in recent if any(ly["role"] == "kick" for ly in b.get("layers", []))
+    ) / len(recent)
+    if kick_pct < 0.85:
+        issues.append(f"KICK at {kick_pct:.0%}. Keep >90%.")
+
+    # --- Texture/synth gain cap ---
+    for b in recent:
+        for ly in b.get("layers", []):
+            if ly.get("role") in ("texture", "synth") and ly.get("gain", 0) > 0.55:
+                issues.append(
+                    f"{ly['role'].upper()} gain={ly['gain']:.2f} too loud. Keep <=0.5."
+                )
+                break
+        else:
+            continue
+        break
+
+    if not issues:
+        return None
+    return " | ".join(issues)
+
+
 DJ_SIGNATURE = "sample_index -> final_status"
 
 DJ_INSTRUCTIONS = """\
-You are a techno DJ streaming audio in real-time. AUDIO CONTINUITY IS CRITICAL.
-The audio buffer drains while you think, so you must render many bars quickly.
+You are a techno DJ streaming audio in real-time.\
+**AUDIO CONTINUITY IS CRITICAL.**
 
-## Iteration 1: Pick palette and start rendering immediately
+The audio buffer drains while you think, so you must render many bars
+quickly.
 
-In your FIRST iteration, do ALL of this in one code block:
-1. Parse sample_index, pick one sample per role (kick, hihat, clap, bassline, perc, synth, texture, fx)
-2. Call set_palette() with your picks
-3. Immediately render at least 48 bars using render_and_play_bar()
+This set must sound like **hypnotic, loop-driven Berghain techno**:
 
-Do NOT spend iterations just exploring — pick samples and start rendering right away.
+-   Repetition with micro-change\
+-   Minimal melody\
+-   Groove-driven\
+-   Subtle evolution\
+-   Long tension plateaus\
+-   No obvious EDM-style drops
 
-## Bar spec format
+------------------------------------------------------------------------
 
-{"layers": [{"role":"kick","type":"oneshot","beats":[0,2],"gain":0.9}, ...]}
+# Iteration 1: Pick Palette and Start Rendering Immediately
 
-- "oneshot": plays sample at beat positions (0-3 in 4/4 time)
-- "loop": stretches sample across entire bar
-- "gain": 0.0 to 1.0
+In your **FIRST iteration**, do ALL of this in one code block:
 
-## CRITICAL: Vary your patterns bar-to-bar
+1.  Parse `sample_index`\
+2.  Pick one sample per role:
+    -   `kick`
+    -   `hihat`
+    -   `clap` (optional, sparse)
+    -   `bassline`
+    -   `perc`
+    -   `synth` (optional, treat as texture)
+    -   `texture`
+    -   `fx`
+3.  Call `set_palette()`\
+4.  Immediately render **at least 64 bars**
 
-DO NOT render the same bar spec in every iteration of your loop. Use the bar
-index to create VARIATION across bars. Example pattern:
+Do NOT explore first.\
+Do NOT print commentary.\
+Pick and start rendering immediately.
 
-```python
+------------------------------------------------------------------------
+
+# Bar Spec Format
+
+``` json
+{"layers": [{"role":"kick","type":"oneshot","beats":[0,2],"gain":0.9}]}
+```
+
+-   `"oneshot"`: plays sample at beat positions (0--3 in 4/4)
+-   `"loop"`: stretches sample across entire bar
+-   `"gain"`: 0.0 to 1.0
+
+------------------------------------------------------------------------
+
+# Hypnotic Variation Rules (CRITICAL)
+
+## 1. Stable Core Loop
+
+For 8--32 bars at a time, keep:
+
+-   Kick pattern stable (usually 4-on-floor)
+-   Hat motor stable
+-   Bassline stable if active
+
+## 2. Micro-Variation Only (Per Bar)
+
+Each bar may introduce at most ONE small change:
+
+-   Slight gain shift (±0.02--0.05)
+-   Occasional ghost perc (very low gain)
+-   Minor hat density shift every 4--8 bars
+-   Texture fade in/out slowly
+
+Do NOT radically change patterns every bar.
+
+## 3. Macro Evolution (Every 32 Bars)
+
+At 32-bar boundaries you may:
+
+-   Add/remove one supporting layer
+-   Increase hat density plateau
+-   Swap perc emphasis
+-   Bring texture forward
+-   Slightly increase overall intensity
+
+Avoid big breakdowns.\
+If dipping energy, remove 1--2 layers for 2--4 bars only.\
+Kick should almost always stay present.
+
+------------------------------------------------------------------------
+
+# DJ Arc Structure (Berghain-Style)
+
+Use 32-bar macro blocks:
+
+**Bars 0--15** - Establish groove - Minimal layers
+
+**Bars 16--23** - Increase tension via hats/perc/texture
+
+**Bars 24--31** - Subtractive dip (short, subtle) - Reintroduce groove
+weight
+
+Then evolve slowly in next 32-bar block.
+
+------------------------------------------------------------------------
+
+# Drop-In Hypnotic Rendering Pattern
+
+Use this as your structural template.
+
+``` python
 for bar in range(64):
     layers = []
-    phrase = bar % 16       # position within 16-bar phrase
-    section = bar // 16     # which section we're in
-    breakdown = 12 <= phrase <= 15  # last 4 bars = breakdown
 
-    # Kick: drop out during breakdowns
-    if not breakdown:
-        beats = [0,1,2,3] if phrase >= 8 else [0,2]
-        layers.append({"role":"kick","type":"oneshot","beats":beats,"gain":0.95})
+    phrase32 = bar % 32
+    macro = bar // 32
+    micro4 = bar % 4
+    micro8 = bar % 8
 
-    # Hihat: vary pattern by bar position
-    hh_patterns = [[1,3], [0,1,2,3], [0,2], [1,2,3]]
-    layers.append({"role":"hihat","type":"oneshot","beats":hh_patterns[phrase%4],"gain":0.5})
+    # --- CORE: Kick (stable hypnotic driver) ---
+    layers.append({
+        "role": "kick",
+        "type": "oneshot",
+        "beats": [0,1,2,3],
+        "gain": 0.95
+    })
 
-    # Clap on backbeat
-    layers.append({"role":"clap","type":"oneshot","beats":[1,3],"gain":0.7})
+    # --- Hat motor (stable but micro-shifting) ---
+    hat_patterns = [
+        [0.5,1.5,2.5,3.5],
+        [0,1,2,3],
+        [1,3],
+    ]
 
-    # Bass and synth: loops with varying gain
-    if not breakdown:
-        layers.append({"role":"bassline","type":"loop","gain":0.6 + phrase*0.02})
-    layers.append({"role":"synth","type":"loop","gain":0.3 if not breakdown else 0.6})
+    hat_choice = 0 if phrase32 < 16 else 1
+    if macro > 0 and phrase32 > 20:
+        hat_choice = 2
 
-    # Perc: add layers over time
-    if phrase >= 4:
-        layers.append({"role":"perc","type":"oneshot","beats":[0,2] if bar%2==0 else [1,3],"gain":0.4})
+    layers.append({
+        "role": "hihat",
+        "type": "oneshot",
+        "beats": hat_patterns[hat_choice],
+        "gain": 0.45 + (micro4 * 0.01)
+    })
 
-    # FX: risers before drops
-    if phrase in (10, 11):
-        layers.append({"role":"fx","type":"oneshot","beats":[3],"gain":0.7})
+    if phrase32 < 28:
+        layers.append({
+            "role": "bassline",
+            "type": "loop",
+            "gain": 0.55 + (macro * 0.05)
+        })
+
+    if phrase32 >= 8:
+        if micro8 in (0,4):
+            layers.append({
+                "role": "perc",
+                "type": "oneshot",
+                "beats": [2],
+                "gain": 0.35
+            })
+        elif micro8 in (2,6):
+            layers.append({
+                "role": "perc",
+                "type": "oneshot",
+                "beats": [1.5,3.5],
+                "gain": 0.28
+            })
+
+    if phrase32 >= 12:
+        layers.append({
+            "role": "texture",
+            "type": "loop",
+            "gain": 0.2 + (phrase32 * 0.005)
+        })
+
+    if 28 <= phrase32 <= 30:
+        layers = [l for l in layers if l["role"] not in ("texture","perc")]
+
+    if phrase32 == 31:
+        layers.append({
+            "role": "fx",
+            "type": "oneshot",
+            "beats": [3],
+            "gain": 0.3
+        })
 
     render_and_play_bar(json.dumps({"layers": layers}))
 ```
 
-## Subsequent iterations: keep rendering
+------------------------------------------------------------------------
 
-Each iteration MUST render at least 32 bars. You may call get_history() and
-llm_query() ONCE per iteration for creative direction, but always render bars.
-Keep your code compact — minimal prints, no state management boilerplate.
+# IMPORTANT: Variable Persistence
 
-## DJ principles
+All variables you define persist across iterations. Your REPL state is
+kept between code blocks. **Do NOT re-declare** helper functions,
+`hat_patterns`, `palette`, or anything else you already defined.
 
-- 16-bar phrases: build energy bars 0-7, peak bars 8-11, breakdown bars 12-15
-- Breakdowns: remove kick and bass, let synth/texture/fx breathe
-- Drops: re-introduce kick+bass after breakdown with full energy
-- Vary hihat patterns every 2-4 bars for groove
-- Change the arrangement every 32-64 bars (swap which roles are active)
+Just use them directly: `palette`, `hat_patterns`, etc. are already in
+scope from iteration 1.
 
-## Rules
+To get the current bar count, `render_and_play_bar()` already returns it
+in every response — parse the bar number from that string. You do NOT
+need to call `get_status()` at the start of each iteration.
 
-- render_and_play_bar() blocks when buffer is full — this IS your timing
-- Do NOT add time.sleep() calls
-- Do NOT spend iterations without rendering bars
-- Call SUBMIT("done") only when you want to stop
+------------------------------------------------------------------------
+
+# Subsequent Iterations
+
+Each iteration MUST:
+
+-   Render at least 48 bars
+-   **Evolve the arrangement** — do NOT copy-paste the same loop
+
+## How to evolve (pick ONE per iteration):
+
+-   Swap the hat pattern (motor → on-beat, or introduce off-beat)
+-   Add or remove one layer (e.g., bring in synth, drop perc)
+-   Shift a gain plateau (e.g., texture 0.2 → 0.3 across 32 bars)
+-   Change perc beat placement
+-   Introduce a 4-bar subtractive moment then restore
+
+## What NOT to do:
+
+-   Re-define helpers, constants, or hat_patterns (already in scope)
+-   Re-call `set_palette()` (already loaded)
+-   Write 20 lines of status-parsing boilerplate
+-   Copy the same rendering loop with only one number changed
+
+Keep code compact: the rendering loop + one evolutionary change.
+
+You may call `get_history()` or `llm_query()` ONCE per iteration for
+creative direction, but always render bars.
+
+------------------------------------------------------------------------
+
+# Critique System
+
+Every 16 bars, `render_and_play_bar()` appends a CRITIQUE line with mix
+diagnostics. **You MUST read and follow these directives.** Examples:
+
+-   `OVER-DENSE avg=5.3/bar` → drop a layer next phrase
+-   `ENERGY RISING +0.08/bar` → hold gains steady or subtract
+-   `STAGNANT` → introduce micro-variation (gain shift, ghost note)
+-   `TOO VARIED` → repeat the same pattern for longer
+-   `KICK at 75%` → keep kick in more bars
+-   `TEXTURE gain=0.60 too loud` → pull texture below 0.5
+-   `On track` → maintain current trajectory
+
+When you receive a critique, adjust your rendering loop accordingly in
+the SAME iteration (modify the loop variables before the next bar).
+
+------------------------------------------------------------------------
+
+# Hard Constraints
+
+-   `render_and_play_bar()` blocks --- this IS your clock\
+-   Do NOT add `time.sleep()`\
+-   Do NOT spend iterations without rendering\
+-   Do NOT re-declare variables/functions from prior iterations\
+-   Call `SUBMIT("done")` only when stopping
 """
 
 
@@ -108,6 +355,7 @@ def run_dj(
     sample_rate: int = 44100,
     lm: str = "openai/gpt-5-mini",
     verbose: bool = False,
+    output: str | None = None,
 ) -> None:
     """Build tools, configure DSPy, invoke RLM, handle shutdown."""
     load_dotenv()
@@ -118,9 +366,17 @@ def run_dj(
     index_json = json.dumps(index, indent=2)
     print(f"Indexed {len(index)} samples.")
 
-    streamer = AudioStreamer(sample_rate=sample_rate)
+    if output:
+        from bergain.streamer import FileWriter
+
+        streamer = FileWriter(output_path=output, sample_rate=sample_rate)
+    else:
+        streamer = AudioStreamer(sample_rate=sample_rate)
     streamer.start()
-    print(f"Audio streamer started (BPM={bpm}, SR={sample_rate})")
+    if output:
+        print(f"Recording to {output} (BPM={bpm}, SR={sample_rate})")
+    else:
+        print(f"Audio streamer started (BPM={bpm}, SR={sample_rate})")
 
     # Shared mutable state for closures
     loaded_samples: dict = {}
@@ -143,6 +399,7 @@ def run_dj(
     def render_and_play_bar(bar_spec_json: str) -> str:
         """Render one bar of audio and stream it. Blocks until buffer has space.
         Input: JSON {"layers": [{"role":"kick","type":"oneshot","beats":[0,2],"gain":0.9}, ...]}
+        Every 16 bars, a CRITIQUE line is appended with mix diagnostics. Follow its directives.
         """
         bar_spec = json.loads(bar_spec_json)
         audio = render_bar(bar_spec, loaded_samples, bpm, sample_rate)
@@ -151,25 +408,37 @@ def run_dj(
         bar_history.append(bar_spec)
         if bars_played[0] % 8 == 0:
             print(f"  Bar {bars_played[0]} (buffer: {streamer.buffer_bars})")
-        return (
+        result = (
             f"Bar {bars_played[0]} queued. "
             f"Buffer: {streamer.buffer_bars}/{streamer.audio_queue.maxsize}"
         )
+        if bars_played[0] % CRITIQUE_INTERVAL == 0:
+            critique = _compute_critique(bar_history)
+            if critique:
+                result += f"\nCRITIQUE: {critique}"
+                print(f"  >> CRITIQUE: {critique}")
+            else:
+                result += "\nCRITIQUE: On track. Maintain current trajectory."
+        return result
 
     def get_status() -> str:
-        """Get current playback status including bars played and buffer level."""
-        return json.dumps(
-            {
-                "bars_played": bars_played[0],
-                "buffer_bars": streamer.buffer_bars,
-                "buffer_max": streamer.audio_queue.maxsize,
-            }
+        """Get current playback status.
+        Returns a plain string like: "bars_played=160 buffer=12/64"
+        """
+        return (
+            f"bars_played={bars_played[0]} "
+            f"buffer={streamer.buffer_bars}/{streamer.audio_queue.maxsize}"
         )
 
     def get_history(last_n: str = "32") -> str:
-        """Get a summary of recent DJ history to detect repetition.
-        Input: number of recent bars to summarize (as string).
-        Returns: JSON with role frequency, energy trajectory, and recent bar specs.
+        """Get a summary of recent DJ history.
+        Input: number of recent bars to summarize (as string, e.g. "32").
+        Returns: JSON string with keys:
+          - bars_summarized (int)
+          - role_frequency (dict: role -> count)
+          - energy_per_4bars (list of floats)
+          - last_4_bars (list of bar spec dicts)
+        Parse with json.loads().
         """
         n = int(last_n)
         recent = bar_history[-n:]

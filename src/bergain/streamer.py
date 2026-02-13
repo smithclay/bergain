@@ -97,3 +97,48 @@ class AudioStreamer:
             self._stream = None
         if self._thread:
             self._thread.join(timeout=2)
+
+
+class FileWriter:
+    """Accumulates AudioSegments and writes to a WAV file on stop().
+
+    Duck-types with AudioStreamer so the DJ can use either backend.
+    No backpressure — renders as fast as possible.
+    """
+
+    def __init__(self, output_path: str, sample_rate: int = 44100):
+        self.output_path = output_path
+        self.sample_rate = sample_rate
+        self._segments: list[AudioSegment] = []
+        self.buffer_bars = 0
+
+    class _FakeQueue:
+        maxsize = 0
+
+    audio_queue = _FakeQueue()
+
+    def start(self) -> None:
+        pass
+
+    def enqueue(self, audio: AudioSegment) -> None:
+        self._segments.append(audio)
+        self.buffer_bars += 1
+
+    def stop(self) -> None:
+        if not self._segments:
+            return
+        from pathlib import Path
+
+        combined = self._segments[0]
+        for seg in self._segments[1:]:
+            combined += seg
+        # Normalize to -1 dBFS
+        change = -1.0 - combined.max_dBFS
+        combined = combined.apply_gain(change)
+        Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+        combined.export(self.output_path, format="wav")
+        total_s = len(combined) / 1000
+        print(f"Wrote {total_s:.1f}s ({total_s / 60:.1f} min) -> {self.output_path}")
+
+    def abort(self) -> None:
+        self.stop()

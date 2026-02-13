@@ -15,6 +15,7 @@ uv run bergain dj --lm "openai/gpt-5-mini" --verbose # With RLM debug output
 ```
 
 Requires Deno for DSPy's sandboxed code interpreter: `curl -fsSL https://deno.land/install.sh | sh`
+Deno must be on `$PATH` (the installer puts it in `~/.deno/bin/`).
 
 ## Architecture
 
