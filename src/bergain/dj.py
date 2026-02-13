@@ -181,6 +181,8 @@ def _auto_correct_bar(
 
 def _apply_stagnation_breaker(bar_spec: dict, history: list[dict]) -> tuple[dict, str]:
     """Apply a subtle random variation when stagnation is detected."""
+    if len(history) < 8:
+        return bar_spec, ""
     recent = [json.dumps(b, sort_keys=True) for b in history[-8:]]
     if len(set(recent)) / max(len(recent), 1) >= 0.2:
         return bar_spec, ""
@@ -190,6 +192,7 @@ def _apply_stagnation_breaker(bar_spec: dict, history: list[dict]) -> tuple[dict
         return bar_spec, ""
 
     action = random.choice(["gain_nudge", "beat_shift", "layer_mute"])
+    msg = ""
 
     if action == "gain_nudge":
         target = random.choice([ly for ly in layers if ly["role"] != "kick"] or layers)
