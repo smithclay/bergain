@@ -23,8 +23,35 @@ DEFAULT_ROLES = ["kick", "hihat", "bassline", "perc", "texture", "clap"]
 
 CRITIQUE_INTERVAL = 8  # bars between trajectory checks
 LLM_CRITIC_INTERVAL = 16  # bars between LLM critic calls
-MAX_LAYERS = 6  # auto-enforced density ceiling
+MAX_LAYERS = 6  # auto-enforced density ceiling (flat fallback)
 GAIN_CAP = {"texture": 0.55, "synth": 0.50}  # auto-enforced gain caps
+
+ENERGY_CURVE = [0.25, 0.50, 0.75, 0.90, 0.90, 0.85, 0.60, 0.30]
+
+
+def _max_layers_at(bar: int, total: int | None) -> int:
+    """Progressive density cap: intro -> peak -> outro."""
+    if total is None:
+        return 6  # infinite mode: flat cap
+    pct = bar / max(total, 1)
+    if pct < 0.125:
+        return 2  # bars 1-8: kick + one
+    elif pct < 0.25:
+        return 4  # bars 9-16: building
+    elif pct < 0.75:
+        return 6  # bars 17-48: full groove
+    elif pct < 0.875:
+        return 4  # bars 49-56: stripping
+    else:
+        return 2  # bars 57-64: outro
+
+
+def _target_energy(bar: int, total: int | None) -> float:
+    """Target energy at this bar position."""
+    if total is None:
+        return 0.80
+    segment = min(int(bar / total * len(ENERGY_CURVE)), len(ENERGY_CURVE) - 1)
+    return ENERGY_CURVE[segment]
 
 
 def _build_role_map(index: list[dict]) -> dict[str, list[dict]]:
@@ -90,7 +117,9 @@ def _pick_random_palette(role_map: dict[str, list[dict]]) -> dict[str, str]:
     return palette
 
 
-def _auto_correct_bar(bar_spec: dict) -> tuple[dict, list[str]]:
+def _auto_correct_bar(
+    bar_spec: dict, bars_played: int = 0, max_bars: int | None = None
+) -> tuple[dict, list[str]]:
     """Apply mechanical guardrails to a bar spec before rendering.
 
     Returns (corrected_spec, list of correction messages).
@@ -106,22 +135,40 @@ def _auto_correct_bar(bar_spec: dict) -> tuple[dict, list[str]]:
             ly["gain"] = GAIN_CAP[role]
             corrections.append(f"auto-capped {role} {old:.2f}->{GAIN_CAP[role]}")
 
-    # Enforce density ceiling: drop lowest-gain non-kick layers
-    if len(layers) > MAX_LAYERS:
+    # Enforce position-aware density ceiling: drop lowest-gain non-kick layers
+    cap = _max_layers_at(bars_played, max_bars)
+    if len(layers) > cap:
         keep = [ly for ly in layers if ly.get("role") == "kick"]
         rest = sorted(
             [ly for ly in layers if ly.get("role") != "kick"],
             key=lambda ly: ly.get("gain", 0),
             reverse=True,
         )
-        layers = keep + rest[: MAX_LAYERS - len(keep)]
-        corrections.append(f"auto-trimmed to {len(layers)} layers")
+        layers = keep + rest[: cap - len(keep)]
+        # Determine phase name for the message
+        if max_bars is not None:
+            pct = bars_played / max(max_bars, 1)
+            if pct < 0.125:
+                phase = "intro phase"
+            elif pct < 0.25:
+                phase = "building phase"
+            elif pct < 0.75:
+                phase = "full groove phase"
+            elif pct < 0.875:
+                phase = "stripping phase"
+            else:
+                phase = "outro phase"
+            corrections.append(f"auto-trimmed to {len(layers)} layers ({phase})")
+        else:
+            corrections.append(f"auto-trimmed to {len(layers)} layers")
 
     bar_spec["layers"] = layers
     return bar_spec, corrections
 
 
-def _compute_critique(history: list[dict]) -> str | None:
+def _compute_critique(
+    history: list[dict], bar: int = 0, total: int | None = None
+) -> str | None:
     """Analyze trajectory and return creative guidance (not mechanical fixes)."""
     window = min(CRITIQUE_INTERVAL, len(history))
     if window < 8:
@@ -137,7 +184,14 @@ def _compute_critique(history: list[dict]) -> str | None:
     avg_first = sum(energies[:half]) / half
     avg_second = sum(energies[half:]) / (len(energies) - half)
     slope = (avg_second - avg_first) / len(energies)
-    if slope > 0.05:
+
+    # Target energy comparison
+    target = _target_energy(bar, total)
+    delta = mean_e - target
+    if abs(delta) > 0.15:
+        direction = "strip back" if delta > 0 else "build up"
+        observations.append(f"energy: {mean_e:.2f}, target: {target:.2f} — {direction}")
+    elif slope > 0.05:
         observations.append(
             f"energy rising (+{slope:.3f}/bar) — consider a plateau or subtractive moment"
         )
@@ -383,7 +437,7 @@ def run_dj(
         bar_spec = json.loads(bar_spec_json)
 
         # Auto-apply mechanical corrections before rendering
-        bar_spec, corrections = _auto_correct_bar(bar_spec)
+        bar_spec, corrections = _auto_correct_bar(bar_spec, bars_played[0], max_bars)
         audio = render_bar(bar_spec, loaded_samples, bpm, sample_rate)
         streamer.enqueue(audio)
         bars_played[0] += 1
@@ -398,7 +452,7 @@ def run_dj(
         if corrections:
             result += " [" + ", ".join(corrections) + "]"
         if bars_played[0] % CRITIQUE_INTERVAL == 0:
-            critique = _compute_critique(bar_history)
+            critique = _compute_critique(bar_history, bars_played[0], max_bars)
             if critique:
                 result += f"\nTRAJECTORY: {critique}"
                 print(f"  >> TRAJECTORY: {critique}")
