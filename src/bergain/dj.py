@@ -179,6 +179,53 @@ def _auto_correct_bar(
     return bar_spec, corrections
 
 
+def _apply_stagnation_breaker(bar_spec: dict, history: list[dict]) -> tuple[dict, str]:
+    """Apply a subtle random variation when stagnation is detected."""
+    recent = [json.dumps(b, sort_keys=True) for b in history[-8:]]
+    if len(set(recent)) / max(len(recent), 1) >= 0.2:
+        return bar_spec, ""
+
+    layers = bar_spec.get("layers", [])
+    if not layers:
+        return bar_spec, ""
+
+    action = random.choice(["gain_nudge", "beat_shift", "layer_mute"])
+
+    if action == "gain_nudge":
+        target = random.choice([ly for ly in layers if ly["role"] != "kick"] or layers)
+        delta = random.choice([-0.1, -0.05, 0.05, 0.1])
+        old = target.get("gain", 0.5)
+        target["gain"] = max(0.1, min(1.0, old + delta))
+        msg = f"AUTO-VARY: nudged {target['role']} gain {old:.2f}->{target['gain']:.2f}"
+
+    elif action == "beat_shift":
+        candidates = [
+            ly for ly in layers if ly.get("type") == "oneshot" and ly.get("beats")
+        ]
+        if not candidates:
+            return bar_spec, ""
+        target = random.choice(candidates)
+        old_beats = target["beats"][:]
+        target["beats"] = [
+            max(0, min(3.5, b + random.choice([-0.5, 0.5]))) for b in target["beats"]
+        ]
+        msg = (
+            f"AUTO-VARY: shifted {target['role']} beats {old_beats}->{target['beats']}"
+        )
+
+    elif action == "layer_mute":
+        non_kick = [ly for ly in layers if ly["role"] != "kick"]
+        if non_kick:
+            muted = random.choice(non_kick)
+            layers.remove(muted)
+            msg = f"AUTO-VARY: muted {muted['role']} for 1 bar"
+        else:
+            return bar_spec, ""
+
+    bar_spec["layers"] = layers
+    return bar_spec, msg
+
+
 def _compute_critique(
     history: list[dict], bar: int = 0, total: int | None = None
 ) -> str | None:
@@ -495,8 +542,11 @@ def run_dj(
         """
         bar_spec = json.loads(bar_spec_json)
 
-        # Auto-apply mechanical corrections before rendering
+        bar_spec, vary_msg = _apply_stagnation_breaker(bar_spec, bar_history)
+        # Auto-apply mechanical corrections after variation
         bar_spec, corrections = _auto_correct_bar(bar_spec, bars_played[0], max_bars)
+        if vary_msg:
+            corrections.insert(0, vary_msg)
         audio = render_bar(bar_spec, loaded_samples, bpm, sample_rate)
         streamer.enqueue(audio)
         bars_played[0] += 1
