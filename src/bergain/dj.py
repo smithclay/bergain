@@ -234,7 +234,7 @@ def _compute_critique(
 ) -> str | None:
     """Analyze trajectory and return creative guidance (not mechanical fixes)."""
     window = min(CRITIQUE_INTERVAL, len(history))
-    if window < 8:
+    if window < CRITIQUE_INTERVAL:
         return None
 
     recent = history[-window:]
