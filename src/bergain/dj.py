@@ -360,8 +360,8 @@ Each iteration: render 8 bars, then review any feedback before continuing.
 Your loop should look like:
     for i in range(8):
         result = render_and_play_bar(...)
-    # After 8 bars: check result for TRAJECTORY/CRITIC feedback
-    # Make ONE subtle adjustment before the next 8-bar block
+    feedback = check_feedback()  # ALWAYS call after each 8-bar block
+    # Read feedback and adjust before next block
 
 You do NOT have to change something every iteration — sometimes hold
 the groove and let it breathe.
@@ -380,6 +380,7 @@ Bigger structural changes (new role, different bassline) every 48-64 bars.
 Every bar, `render_and_play_bar()` returns bar count and buffer depth.
 Every 8 bars: TRAJECTORY feedback (energy direction, density, repetition).
 Every 16 bars: CRITIC feedback (specific, actionable creative direction).
+After every 8-bar block, call `check_feedback()`. Read the feedback and adjust before rendering the next block.
 Prioritize CRITIC over TRAJECTORY when they conflict.
 
 # Constraints
@@ -441,6 +442,7 @@ def run_dj(
     loaded_samples = load_palette(palette, sample_rate)
     bars_played = [0]
     bar_history: list[dict] = []
+    pending_feedback: list[str] = []
 
     # --- RLM Tool Functions (closures over shared state) ---
 
@@ -482,12 +484,14 @@ def run_dj(
         if bars_played[0] % CRITIQUE_INTERVAL == 0:
             critique = _compute_critique(bar_history, bars_played[0], max_bars)
             if critique:
-                result += f"\nTRAJECTORY: {critique}"
+                pending_feedback.append(f"TRAJECTORY: {critique}")
+                result += " | FEEDBACK_AVAILABLE"
                 print(f"  >> TRAJECTORY: {critique}")
         if bars_played[0] % LLM_CRITIC_INTERVAL == 0:
             llm_feedback = _llm_critique(bar_history, cheap_lm)
             if llm_feedback:
-                result += f"\nCRITIC: {llm_feedback}"
+                pending_feedback.append(f"CRITIC: {llm_feedback}")
+                result += " | FEEDBACK_AVAILABLE"
                 print(f"  >> CRITIC: {llm_feedback}")
         if max_bars and bars_played[0] >= max_bars:
             print(f"\nReached {max_bars}-bar limit. Draining buffer...")
@@ -534,6 +538,15 @@ def run_dj(
             }
         )
 
+    def check_feedback() -> str:
+        """Check for trajectory and critic feedback. Call this between bar groups.
+        Returns: feedback text, or 'none' if no feedback pending."""
+        if not pending_feedback:
+            return "none"
+        result = "\n".join(pending_feedback)
+        pending_feedback.clear()
+        return result
+
     # --- Signal handling ---
     def _shutdown(signum, frame):
         print("\nShutting down DJ...")
@@ -557,7 +570,7 @@ def run_dj(
     signature = dspy.Signature(DJ_SIGNATURE, instructions=instructions)
     rlm = dspy.RLM(
         signature,
-        tools=[swap_sample, render_and_play_bar, get_history],
+        tools=[swap_sample, render_and_play_bar, get_history, check_feedback],
         max_iterations=100,
         max_llm_calls=500,
         verbose=verbose,
