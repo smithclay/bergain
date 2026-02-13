@@ -182,7 +182,7 @@ def _compute_critique(history: list[dict]) -> str | None:
 def _llm_critique(history: list[dict], lm: dspy.LM) -> str | None:
     """Ask an LM to critique the recent DJ set."""
     window = min(LLM_CRITIC_INTERVAL, len(history))
-    if window < 16:
+    if window < LLM_CRITIC_INTERVAL:
         return None
 
     recent = history[-window:]
