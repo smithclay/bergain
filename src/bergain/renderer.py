@@ -34,6 +34,45 @@ def _load_sample(path: str, sample_rate: int) -> AudioSegment:
     return seg
 
 
+def load_palette(palette: dict[str, str], sample_rate: int) -> dict[str, AudioSegment]:
+    """Load all palette samples into memory. Returns role -> AudioSegment."""
+    return {role: _load_sample(path, sample_rate) for role, path in palette.items()}
+
+
+def render_bar(
+    bar_spec: dict,
+    samples: dict[str, AudioSegment],
+    bpm: float,
+    sample_rate: int,
+) -> AudioSegment:
+    """Render a single bar from a bar spec. Returns an AudioSegment of 1 bar (4 beats).
+
+    bar_spec: {"layers": [{"role": "kick", "type": "oneshot", "beats": [0, 2], "gain": 0.9}, ...]}
+    """
+    beat_ms = 60_000 / bpm
+    bar_ms = int(beat_ms * 4)
+    bar_audio = AudioSegment.silent(duration=bar_ms, frame_rate=sample_rate)
+
+    for layer in bar_spec.get("layers", []):
+        role = layer["role"]
+        if role not in samples:
+            continue
+        sample = samples[role]
+        gain_db = _gain_to_db(layer.get("gain", 1.0))
+        adjusted = sample + gain_db
+
+        if layer["type"] == "loop":
+            looped = _loop_to_length(adjusted, bar_ms)
+            bar_audio = bar_audio.overlay(looped)
+        elif layer["type"] == "oneshot":
+            for beat in layer.get("beats", [0]):
+                pos_ms = int(beat * beat_ms)
+                if pos_ms < bar_ms:
+                    bar_audio = bar_audio.overlay(adjusted, position=pos_ms)
+
+    return bar_audio
+
+
 def render(arrangement: dict, output_wav_path: str) -> None:
     bpm = arrangement["bpm"]
     sample_rate = arrangement["sample_rate"]

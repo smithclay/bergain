@@ -1,5 +1,5 @@
 """
-CLI entry point: bergain generate | play
+CLI entry point: bergain generate | play | dj
 """
 
 import time
@@ -72,3 +72,17 @@ def play(file):
         play_wav(str(wav_path))
     else:
         raise click.ClickException(f"Unsupported file type: {path.suffix}")
+
+
+@cli.command()
+@click.option(
+    "--sample-dir", default="sample_pack", help="Path to sample pack directory."
+)
+@click.option("--bpm", type=int, default=128, help="Beats per minute.")
+@click.option("--lm", required=True, help="LiteLLM model ID, e.g. 'openai/gpt-4o'.")
+@click.option("--verbose", is_flag=True, help="Show RLM execution details.")
+def dj(sample_dir, bpm, lm, verbose):
+    """Start a streaming DJ set powered by DSPy RLM."""
+    from bergain.dj import run_dj
+
+    run_dj(sample_dir=sample_dir, bpm=bpm, lm=lm, verbose=verbose)
