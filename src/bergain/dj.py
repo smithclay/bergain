@@ -2,10 +2,12 @@
 DSPy RLM-powered streaming DJ.
 
 The RLM writes its own DJ loop in a sandboxed REPL, driving audio output
-through tool functions. Palette is pre-loaded; the RLM focuses on rendering
-bars and evolving the set.
+through mixer-control tool functions. Server-side mixer state replaces
+client-side layer construction — the RLM uses add/fader/pattern/mute
+controls instead of building JSON layer arrays.
 """
 
+import copy
 import json
 import random
 import signal
@@ -27,15 +29,15 @@ GAIN_CAP = {"texture": 0.55, "synth": 0.50}  # auto-enforced gain caps
 
 ENERGY_CURVE = [0.25, 0.50, 0.75, 0.90, 0.90, 0.85, 0.60, 0.30]
 
-BEAT_PATTERNS = {
-    "FOUR_ON_FLOOR": [0, 1, 2, 3],
-    "OFFBEAT_8THS": [0.5, 1.5, 2.5, 3.5],
-    "SYNCOPATED_A": [0.5, 2.5],
-    "SYNCOPATED_B": [1.5, 3.5],
-    "BACKBEAT": [1, 3],
-    "SPARSE_ACCENT": [1],
-    "GALLOP": [0, 0.5, 2, 2.5],
-    "SIXTEENTH_DRIVE": [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5],
+NAMED_PATTERNS = {
+    "four_on_floor": [0, 1, 2, 3],
+    "offbeat_8ths": [0.5, 1.5, 2.5, 3.5],
+    "syncopated_a": [0.5, 2.5],
+    "syncopated_b": [1.5, 3.5],
+    "backbeat": [1, 3],
+    "sparse_accent": [1],
+    "gallop": [0, 0.5, 2, 2.5],
+    "sixteenth_drive": [0, 0.5, 1, 1.5, 2, 2.5, 3, 3.5],
 }
 
 # Structural arc phases: (threshold, layer_cap, phase_name)
@@ -50,24 +52,15 @@ _ARC_PHASES = [
 _DEFAULT_CAP = 6  # infinite mode: flat cap
 
 
-def _max_layers_at(bar: int, total: int | None) -> int:
-    """Progressive density cap: intro -> peak -> outro."""
+def _phase_at(bar: int, total: int | None) -> tuple[int, str]:
+    """Return (layer_cap, phase_name) at a bar position."""
     if total is None:
-        return _DEFAULT_CAP
+        return _DEFAULT_CAP, "infinite"
     pct = bar / max(total, 1)
-    for threshold, cap, _ in _ARC_PHASES:
+    for threshold, cap, name in _ARC_PHASES:
         if pct < threshold:
-            return cap
-    return 2
-
-
-def _phase_name_at(bar: int, total: int) -> str:
-    """Return the structural phase name at a bar position."""
-    pct = bar / max(total, 1)
-    for threshold, _, name in _ARC_PHASES:
-        if pct < threshold:
-            return name
-    return "outro phase"
+            return cap, name
+    return 2, "outro phase"
 
 
 def _target_energy(bar: int, total: int | None) -> float:
@@ -141,6 +134,35 @@ def _pick_random_palette(role_map: dict[str, list[dict]]) -> dict[str, str]:
     return palette
 
 
+def _resolve_pattern(name_or_array: str) -> list:
+    """Resolve a named pattern or JSON array string to beat positions."""
+    lookup = name_or_array.strip().lower()
+    if lookup in NAMED_PATTERNS:
+        return list(NAMED_PATTERNS[lookup])
+    try:
+        parsed = json.loads(name_or_array)
+        if isinstance(parsed, list):
+            return parsed
+    except (json.JSONDecodeError, TypeError):
+        pass
+    raise ValueError(
+        f"Unknown pattern '{name_or_array}'. Known: {', '.join(NAMED_PATTERNS.keys())}"
+    )
+
+
+def _mixer_to_layers(mixer_state: dict[str, dict]) -> list[dict]:
+    """Convert mixer_state into a layer list for the renderer."""
+    layers = []
+    for role, ch in mixer_state.items():
+        if ch.get("muted"):
+            continue
+        layer = {"role": role, "type": ch["type"], "gain": ch["gain"]}
+        if ch["type"] == "oneshot":
+            layer["beats"] = ch["pattern"]
+        layers.append(layer)
+    return layers
+
+
 def _auto_correct_bar(
     bar_spec: dict, bars_played: int = 0, max_bars: int | None = None
 ) -> tuple[dict, list[str]]:
@@ -160,7 +182,7 @@ def _auto_correct_bar(
             corrections.append(f"auto-capped {role} {old:.2f}->{GAIN_CAP[role]}")
 
     # Enforce position-aware density ceiling: drop lowest-gain non-kick layers
-    cap = _max_layers_at(bars_played, max_bars)
+    cap, phase = _phase_at(bars_played, max_bars)
     if len(layers) > cap:
         keep = [ly for ly in layers if ly.get("role") == "kick"]
         rest = sorted(
@@ -169,64 +191,10 @@ def _auto_correct_bar(
             reverse=True,
         )
         layers = keep + rest[: max(0, cap - len(keep))]
-        if max_bars is not None:
-            phase = _phase_name_at(bars_played, max_bars)
-            corrections.append(f"auto-trimmed to {len(layers)} layers ({phase})")
-        else:
-            corrections.append(f"auto-trimmed to {len(layers)} layers")
+        corrections.append(f"auto-trimmed to {len(layers)} layers ({phase})")
 
     bar_spec["layers"] = layers
     return bar_spec, corrections
-
-
-def _apply_stagnation_breaker(bar_spec: dict, history: list[dict]) -> tuple[dict, str]:
-    """Apply a subtle random variation when stagnation is detected."""
-    if len(history) < 8:
-        return bar_spec, ""
-    recent = [json.dumps(b, sort_keys=True) for b in history[-8:]]
-    if len(set(recent)) / max(len(recent), 1) >= 0.2:
-        return bar_spec, ""
-
-    layers = bar_spec.get("layers", [])
-    if not layers:
-        return bar_spec, ""
-
-    action = random.choice(["gain_nudge", "beat_shift", "layer_mute"])
-    msg = ""
-
-    if action == "gain_nudge":
-        target = random.choice([ly for ly in layers if ly["role"] != "kick"] or layers)
-        delta = random.choice([-0.1, -0.05, 0.05, 0.1])
-        old = target.get("gain", 0.5)
-        target["gain"] = max(0.1, min(1.0, old + delta))
-        msg = f"AUTO-VARY: nudged {target['role']} gain {old:.2f}->{target['gain']:.2f}"
-
-    elif action == "beat_shift":
-        candidates = [
-            ly for ly in layers if ly.get("type") == "oneshot" and ly.get("beats")
-        ]
-        if not candidates:
-            return bar_spec, ""
-        target = random.choice(candidates)
-        old_beats = target["beats"][:]
-        target["beats"] = [
-            max(0, min(3.5, b + random.choice([-0.5, 0.5]))) for b in target["beats"]
-        ]
-        msg = (
-            f"AUTO-VARY: shifted {target['role']} beats {old_beats}->{target['beats']}"
-        )
-
-    elif action == "layer_mute":
-        non_kick = [ly for ly in layers if ly["role"] != "kick"]
-        if non_kick:
-            muted = random.choice(non_kick)
-            layers.remove(muted)
-            msg = f"AUTO-VARY: muted {muted['role']} for 1 bar"
-        else:
-            return bar_spec, ""
-
-    bar_spec["layers"] = layers
-    return bar_spec, msg
 
 
 def _compute_critique(
@@ -249,7 +217,7 @@ def _compute_critique(
     slope = (avg_second - avg_first) / len(energies)
 
     # Target energy comparison (normalize sum-of-gains to 0-1 scale)
-    normalized_e = mean_e / _DEFAULT_CAP
+    normalized_e = mean_e / max(_phase_at(bar, total)[0], 1)
     target = _target_energy(bar, total)
     delta = normalized_e - target
     if abs(delta) > 0.15:
@@ -299,7 +267,9 @@ def _compute_critique(
     return " | ".join(observations)
 
 
-def _llm_critique(history: list[dict], lm: dspy.LM) -> str | None:
+def _llm_critique(
+    history: list[dict], total_bars_played: int, lm: dspy.LM
+) -> str | None:
     """Ask an LM to critique the recent DJ set."""
     window = min(LLM_CRITIC_INTERVAL, len(history))
     if window < LLM_CRITIC_INTERVAL:
@@ -320,7 +290,7 @@ def _llm_critique(history: list[dict], lm: dspy.LM) -> str | None:
     last_4 = json.dumps(recent[-4:], indent=1)
 
     prompt = f"""\
-You are a Berghain resident DJ reviewing a set in progress ({window} bars so far).
+You are a Berghain resident DJ reviewing a set in progress (bar {total_bars_played}, reviewing last {window} bars).
 
 Energy per bar: {energies}
 Role usage: {json.dumps(role_counts)}
@@ -354,92 +324,64 @@ Be specific about timing (how many bars) and which roles to change."""
 DJ_SIGNATURE = "sample_menu -> final_status"
 
 DJ_INSTRUCTIONS = """\
-You are a Berghain techno DJ streaming audio bar-by-bar in real-time.
+You are a Berghain resident DJ. The room breathes — layers enter and leave,
+gains shift constantly, the groove evolves every few bars. A flat mix
+clears the dance floor.
 
-A palette of samples is already loaded. Start rendering bars immediately
-in your FIRST code block — no setup needed.
+# Setup — add channels, then enter your loop
+add("kick", "0.92", "four_on_floor")
+play("4")
+add("hihat", "0.55", "offbeat_8ths")
+add("bassline", "0.65", type="loop")
+play("4")
+fader("bassline", "0.72")
+add("perc", "0.40", "syncopated_a")
+add("texture", "0.30", type="loop")
+add("clap", "0.45", "backbeat")
+play("4")                                  # all 6 channels on
 
-`sample_menu` is a JSON dict of ALL available samples by role. You only
-need it if you want to swap a sample later via `swap_sample()`.
+# Main loop — ALWAYS evolve between play() calls
+while True:
+    status = json.loads(play("4"))
+    feedback = status.get("feedback")
 
-# Bar Spec Format
+    if feedback:
+        direction = llm_query(
+            f"Feedback: {feedback}\\n"
+            f"Mixer: {json.dumps(status['mixer'])}\\n"
+            f"Phase: {status['phase']}, Energy: {status['energy']}\\n"
+            "Suggest ONE mixer action. Be specific: fader/pattern/swap/add/remove/mute/breakdown."
+        )
+        # Parse direction and apply it
 
-```json
-{"layers": [{"role":"kick","type":"oneshot","beats":[0,1,2,3],"gain":0.9}]}
-```
+    # ALWAYS tweak between phrases — pick from:
+    # fader("hihat", "0.50")     — nudge gain ±0.05
+    # pattern("perc", "gallop")  — shift the rhythm
+    # swap("hihat", "random")    — refresh a stale sound
+    # breakdown("4")             — tension moment (use sparingly)
+    # mute("texture")            — create space
 
-- `"oneshot"`: triggers sample at beat positions (0-3 in 4/4, fractional ok)
-- `"loop"`: stretches/loops sample across the full bar
-- `"gain"`: 0.0 to 1.0 (texture/synth auto-capped at 0.55/0.50)
+# Feedback response guide
+# "build up"  → add() or unmute() a channel
+# "strip back" → mute() or remove() a channel
+# "stagnant"  → pattern(), swap(), or breakdown()
+# CRITIC      → follow literally (specific roles + values)
 
-# Sound Design
+# Phase targets (active channels)
+# intro: 1-2 | building: 3-4 | peak: 4-6 | stripping: 2-3 | outro: 1
 
-Think Berghain — GROOVE, WEIGHT, ATMOSPHERE.
+# Gain ranges
+# kick: 0.90-0.95 | hihat: 0.50-0.65 | bassline: 0.60-0.75
+# perc: 0.35-0.50 | texture: 0.30-0.50 | clap: 0.40-0.55
 
-Gain staging:
-- Kick: 0.90-0.95, 4-on-floor [0,1,2,3] — ALWAYS
-- Hihat: 0.50-0.65 — offbeat [0.5,1.5,2.5,3.5] or 16ths for intensity
-- Bassline: 0.60-0.75 — deep and present
-- Perc: 0.35-0.50 — syncopated [1.5], [2.5], [1,3], [0.5,2.5]
-- Texture: 0.30-0.50 — atmosphere, use type "loop"
-- Clap: 0.40-0.55 — on [1] or [1,3], NOT every beat
+# Patterns: four_on_floor, offbeat_8ths, syncopated_a, syncopated_b,
+#   backbeat, sparse_accent, gallop, sixteenth_drive
 
-Intro (first 16 bars): build from kick alone → add hat → bassline → full groove.
-Body: full groove with slow evolution over 32-bar arcs.
-Outro (last 16 bars): strip layers back to kick alone.
-
-Keep hats/perc at AUDIBLE gains (0.4+), at least 3-4 layers at peak moments.
-
-# Beat Patterns (use these names or raw arrays)
-FOUR_ON_FLOOR = [0,1,2,3]        # kick standard
-OFFBEAT_8THS  = [0.5,1.5,2.5,3.5] # classic hat
-SYNCOPATED_A  = [0.5, 2.5]        # minimal perc
-SYNCOPATED_B  = [1.5, 3.5]        # displaced feel
-BACKBEAT      = [1, 3]            # clap/snare standard
-SPARSE_ACCENT = [1]               # less-is-more
-GALLOP        = [0, 0.5, 2, 2.5]  # driving energy
-SIXTEENTH_DRIVE    = [0,0.5,1,1.5,2,2.5,3,3.5]  # maximum intensity
-
-Variation idea: switch hihat from OFFBEAT_8THS to SYNCOPATED_A for 4 bars.
-
-# Evolution
-
-Berghain pacing: changes happen SLOWLY. Ride a groove for 32+ bars.
-
-Each iteration: render 8 bars, then review any feedback before continuing.
-Your loop should look like:
-    for i in range(8):
-        result = render_and_play_bar(...)
-    feedback = check_feedback()  # ALWAYS call after each 8-bar block
-    # Read feedback and adjust before next block
-
-You do NOT have to change something every iteration — sometimes hold
-the groove and let it breathe.
-
-When you DO evolve (every 2-3 iterations), pick ONE subtle move:
-- Shift a gain to reshape energy
-- Move a perc hit to a different beat position
-- Swap a sample: call `list_alternatives("hihat")` to see options,
-  then `swap_sample("hihat", "3")` or `swap_sample("hihat", "random")`
-- 2-4 bar subtractive moment (drop a layer) then restore
-
-Bigger structural changes (new role, different bassline) every 48-64 bars.
-
-# Feedback
-
-Every bar, `render_and_play_bar()` returns bar count and buffer depth.
-Every 8 bars: TRAJECTORY feedback (energy direction, density, repetition).
-Every 16 bars: CRITIC feedback (specific, actionable creative direction).
-After every 8-bar block, call `check_feedback()`. Read the feedback and adjust before rendering the next block.
-Prioritize CRITIC over TRAJECTORY when they conflict.
-
-# Constraints
-
-- `render_and_play_bar()` blocks — this IS your clock
-- Do NOT add `time.sleep()`
-- Do NOT spend iterations without rendering
-- Variables persist between iterations — do NOT redeclare them
-- Call `SUBMIT("done")` only when stopping
+# Rules
+# - play("4") is one phrase. ALWAYS make a mixer move between phrases.
+# - play() blocks — it IS your clock. No time.sleep().
+# - Variables persist — do NOT redeclare them.
+# - Call SUBMIT("done") only when stopping.
 """
 
 
@@ -492,142 +434,258 @@ def run_dj(
     loaded_samples = load_palette(palette, sample_rate)
     bars_played = [0]
     bar_history: list[dict] = []
-    pending_feedback: list[str] = []
+    mixer_state: dict[str, dict] = {}
 
-    # --- RLM Tool Functions (closures over shared state) ---
+    # --- Internal helpers (closures over shared state) ---
 
-    def list_alternatives(role: str) -> str:
-        """List available alternative samples for a role.
-        Input: role name (e.g., "hihat")
-        Returns: numbered list of alternatives."""
-        alternatives = role_map.get(role, [])
-        current = palette.get(role, "")
-        lines = [f"Current {role}: {current.split('/')[-1]}"]
-        for i, s in enumerate(alternatives):
-            if s["path"] != current:
-                marker = " (loop)" if s.get("loop") else ""
-                lines.append(f"  {i}: {s['name']}{marker}")
-        return "\n".join(lines)
+    def _mixer_snapshot() -> dict:
+        """Return a JSON-safe snapshot of mixer_state."""
+        return {role: dict(ch) for role, ch in mixer_state.items()}
 
-    def swap_sample(role: str, index: str = "random") -> str:
-        """Swap a sample by role and index number.
-        Examples: swap_sample("hihat", "3") or swap_sample("perc", "random")"""
+    def _respond(**data) -> str:
+        """JSON response with mixer snapshot appended."""
+        return json.dumps({**data, "mixer": _mixer_snapshot()})
+
+    def _render_bars(n: int) -> list[str]:
+        """Render N bars from current mixer state. Returns corrections."""
+        all_corrections: list[str] = []
+        for _ in range(n):
+            layers = _mixer_to_layers(mixer_state)
+            bar_spec = {"layers": copy.deepcopy(layers)}
+
+            bar_spec, corrections = _auto_correct_bar(
+                bar_spec, bars_played[0], max_bars
+            )
+
+            audio = render_bar(bar_spec, loaded_samples, bpm, sample_rate)
+            streamer.enqueue(audio)
+            bars_played[0] += 1
+            bar_history.append(bar_spec)
+
+            if bars_played[0] % 8 == 0:
+                print(f"  Bar {bars_played[0]} (buffer: {streamer.buffer_bars})")
+            for c in corrections:
+                print(f"  >> {c}")
+            all_corrections.extend(corrections)
+
+            if max_bars and bars_played[0] >= max_bars:
+                print(f"\nReached {max_bars}-bar limit. Draining buffer...")
+                if hasattr(streamer, "drain"):
+                    streamer.drain()
+                streamer.stop()
+                print(f"Total bars played: {bars_played[0]}")
+                import os
+
+                os._exit(0)
+        return all_corrections
+
+    def _build_status(all_corrections: list[str], count: int) -> str:
+        """Build JSON status response after rendering bars."""
+        feedback_items = []
+        if bars_played[0] % CRITIQUE_INTERVAL == 0:
+            critique = _compute_critique(bar_history, bars_played[0], max_bars)
+            if critique:
+                feedback_items.append(f"TRAJECTORY: {critique}")
+                print(f"  >> TRAJECTORY: {critique}")
+        if bars_played[0] % LLM_CRITIC_INTERVAL == 0:
+            llm_feedback = _llm_critique(bar_history, bars_played[0], cheap_lm)
+            if llm_feedback:
+                feedback_items.append(f"CRITIC: {llm_feedback}")
+                print(f"  >> CRITIC: {llm_feedback}")
+
+        cap, phase = _phase_at(bars_played[0], max_bars)
+        recent_energies = [
+            sum(ly.get("gain", 0.5) for ly in b.get("layers", []))
+            for b in bar_history[-count:]
+        ]
+        mean_energy = sum(recent_energies) / max(len(recent_energies), 1)
+        normalized_energy = round(mean_energy / max(cap, 1), 2)
+        target = round(_target_energy(bars_played[0], max_bars), 2)
+
+        return json.dumps(
+            {
+                "bars_played": bars_played[0],
+                "phase": phase,
+                "energy": normalized_energy,
+                "target_energy": target,
+                "corrections": all_corrections,
+                "feedback": "\n".join(feedback_items) if feedback_items else None,
+                "mixer": _mixer_snapshot(),
+                "buffer_depth": streamer.buffer_bars,
+            }
+        )
+
+    # --- RLM Tool Functions ---
+
+    def play(bars: str = "4") -> str:
+        """Advance the mix by N bars. Returns JSON status with bars_played,
+        phase, energy, target_energy, corrections, feedback, mixer,
+        buffer_depth."""
+        n = int(bars)
+        all_corrections = _render_bars(n)
+        return _build_status(all_corrections, n)
+
+    def breakdown(bars: str = "4") -> str:
+        """Mute all channels except kick for N bars, then auto-restore.
+        Returns JSON status."""
+        n = int(bars)
+        # Save current mute states
+        saved = {role: ch.get("muted", False) for role, ch in mixer_state.items()}
+        # Mute everything except kick
+        for role, ch in mixer_state.items():
+            if role != "kick":
+                ch["muted"] = True
+        print(f"  >> BREAKDOWN: {n} bars (kick only)")
+        all_corrections = _render_bars(n)
+        # Restore previous mute states
+        for role, was_muted in saved.items():
+            if role in mixer_state:
+                mixer_state[role]["muted"] = was_muted
+        print("  >> BREAKDOWN: restored")
+        return _build_status(all_corrections, n)
+
+    def add(
+        role: str, gain: str, pattern: str = "four_on_floor", type: str = "oneshot"
+    ) -> str:
+        """Add a channel to the mixer. Returns JSON with mixer snapshot."""
+        resolved = _resolve_pattern(pattern) if type == "oneshot" else []
+        mixer_state[role] = {
+            "type": type,
+            "gain": float(gain),
+            "pattern": resolved,
+            "muted": False,
+        }
+        # Ensure sample is loaded
+        if role not in loaded_samples:
+            if role in palette:
+                from pydub import AudioSegment
+
+                seg = (
+                    AudioSegment.from_file(palette[role])
+                    .set_channels(1)
+                    .set_frame_rate(sample_rate)
+                )
+                loaded_samples[role] = seg
+            else:
+                del mixer_state[role]
+                return json.dumps(
+                    {
+                        "error": f"No sample loaded for '{role}'. "
+                        f"Available roles: {list(palette.keys())}",
+                    }
+                )
+        print(
+            f"  >> Added channel: {role} (gain={gain}, pattern={pattern}, type={type})"
+        )
+        return _respond(added=role)
+
+    def remove(role: str) -> str:
+        """Remove a channel from the mixer. Returns JSON with mixer snapshot."""
+        removed = mixer_state.pop(role, None)
+        if removed is None:
+            return json.dumps({"error": f"No channel '{role}' on mixer"})
+        print(f"  >> Removed channel: {role}")
+        return _respond(removed=role)
+
+    def fader(role: str, gain: str) -> str:
+        """Adjust a channel's volume. Returns JSON with mixer snapshot."""
+        if role not in mixer_state:
+            return json.dumps({"error": f"No channel '{role}' on mixer"})
+        mixer_state[role]["gain"] = float(gain)
+        print(f"  >> Fader: {role} -> {gain}")
+        return _respond(role=role, gain=float(gain))
+
+    def pattern(role: str, name_or_array: str) -> str:
+        """Change a channel's beat pattern. Accepts named patterns or JSON
+        arrays. Returns JSON with mixer snapshot."""
+        if role not in mixer_state:
+            return json.dumps({"error": f"No channel '{role}' on mixer"})
+        try:
+            resolved = _resolve_pattern(name_or_array)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+        mixer_state[role]["pattern"] = resolved
+        print(f"  >> Pattern: {role} -> {name_or_array} ({resolved})")
+        return _respond(role=role, pattern=resolved)
+
+    def mute(role: str) -> str:
+        """Mute a channel (preserves all settings). Returns JSON with mixer snapshot."""
+        if role not in mixer_state:
+            return json.dumps({"error": f"No channel '{role}' on mixer"})
+        mixer_state[role]["muted"] = True
+        print(f"  >> Muted: {role}")
+        return _respond(muted=role)
+
+    def unmute(role: str) -> str:
+        """Unmute a channel. Returns JSON with mixer snapshot."""
+        if role not in mixer_state:
+            return json.dumps({"error": f"No channel '{role}' on mixer"})
+        mixer_state[role]["muted"] = False
+        print(f"  >> Unmuted: {role}")
+        return _respond(unmuted=role)
+
+    def swap(role: str, choice: str = "") -> str:
+        """Browse alternatives or swap sample for a role.
+        - swap("hihat") → list alternatives
+        - swap("hihat", "3") → swap to index 3
+        - swap("hihat", "random") → swap randomly
+        Returns: JSON string."""
         alternatives = role_map.get(role, [])
         if not alternatives:
-            return f"No alternatives for {role}"
-        if index == "random":
-            choice = random.choice(alternatives)
+            return json.dumps({"error": f"No alternatives for {role}"})
+
+        # List mode: no choice provided
+        if not choice:
+            current = palette.get(role, "")
+            options = []
+            for i, s in enumerate(alternatives):
+                entry = {"index": i, "name": s["name"], "loop": s.get("loop", False)}
+                if s["path"] == current:
+                    entry["current"] = True
+                options.append(entry)
+            return json.dumps(
+                {
+                    "role": role,
+                    "current": current.split("/")[-1],
+                    "alternatives": options,
+                }
+            )
+
+        # Swap mode
+        if choice == "random":
+            picked = random.choice(alternatives)
         else:
             try:
-                idx = int(index)
+                idx = int(choice)
             except ValueError:
-                return f"Invalid index '{index}' — use a number or 'random'"
+                return json.dumps(
+                    {"error": f"Invalid choice '{choice}' — use a number or 'random'"}
+                )
             if idx < 0 or idx >= len(alternatives):
-                return f"Invalid index {idx} for {role} (0-{len(alternatives) - 1} available)"
-            choice = alternatives[idx]
+                return json.dumps(
+                    {
+                        "error": f"Index {idx} out of range for {role} (0-{len(alternatives) - 1})"
+                    }
+                )
+            picked = alternatives[idx]
+
         from pydub import AudioSegment
 
         seg = (
-            AudioSegment.from_file(choice["path"])
+            AudioSegment.from_file(picked["path"])
             .set_channels(1)
             .set_frame_rate(sample_rate)
         )
         loaded_samples[role] = seg
-        palette[role] = choice["path"]
-        print(f"  Swapped {role} -> {choice['name']}")
-        return (
-            f"Swapped {role} to {choice['name']}. Active: {list(loaded_samples.keys())}"
-        )
-
-    def render_and_play_bar(bar_spec_json: str) -> str:
-        """Render one bar of audio and stream it. Blocks until buffer has space.
-        Input: JSON {"layers": [{"role":"kick","type":"oneshot","beats":[0,2],"gain":0.9}, ...]}
-        """
-        bar_spec = json.loads(bar_spec_json)
-
-        bar_spec, vary_msg = _apply_stagnation_breaker(bar_spec, bar_history)
-        # Auto-apply mechanical corrections after variation
-        bar_spec, corrections = _auto_correct_bar(bar_spec, bars_played[0], max_bars)
-        if vary_msg:
-            corrections.insert(0, vary_msg)
-        audio = render_bar(bar_spec, loaded_samples, bpm, sample_rate)
-        streamer.enqueue(audio)
-        bars_played[0] += 1
-        bar_history.append(bar_spec)
-
-        if bars_played[0] % 8 == 0:
-            print(f"  Bar {bars_played[0]} (buffer: {streamer.buffer_bars})")
-        for c in corrections:
-            print(f"  >> {c}")
-
-        result = f"bar={bars_played[0]} buf={streamer.buffer_bars}"
-        if corrections:
-            result += " [" + ", ".join(corrections) + "]"
-        if bars_played[0] % CRITIQUE_INTERVAL == 0:
-            critique = _compute_critique(bar_history, bars_played[0], max_bars)
-            if critique:
-                pending_feedback.append(f"TRAJECTORY: {critique}")
-                result += " | FEEDBACK_AVAILABLE"
-                print(f"  >> TRAJECTORY: {critique}")
-        if bars_played[0] % LLM_CRITIC_INTERVAL == 0:
-            llm_feedback = _llm_critique(bar_history, cheap_lm)
-            if llm_feedback:
-                pending_feedback.append(f"CRITIC: {llm_feedback}")
-                result += " | FEEDBACK_AVAILABLE"
-                print(f"  >> CRITIC: {llm_feedback}")
-        if max_bars and bars_played[0] >= max_bars:
-            print(f"\nReached {max_bars}-bar limit. Draining buffer...")
-            if hasattr(streamer, "drain"):
-                streamer.drain()
-            streamer.stop()
-            print(f"Total bars played: {bars_played[0]}")
-            import os
-
-            os._exit(0)
-        return result
-
-    def get_history(last_n: str = "32") -> str:
-        """Get a summary of recent DJ history.
-        Input: number of recent bars to summarize (as string, e.g. "32").
-        Returns: JSON string with keys:
-          - bars_summarized (int)
-          - role_frequency (dict: role -> count)
-          - energy_per_4bars (list of floats)
-          - last_4_bars (list of bar spec dicts)
-        Parse with json.loads().
-        """
-        n = int(last_n)
-        recent = bar_history[-n:]
-        # Role frequency counts
-        role_counts: dict[str, int] = {}
-        for bar in recent:
-            for layer in bar.get("layers", []):
-                role_counts[layer["role"]] = role_counts.get(layer["role"], 0) + 1
-        # Energy per 4-bar group
-        energy_trajectory = []
-        for i in range(0, len(recent), 4):
-            chunk = recent[i : i + 4]
-            avg = sum(
-                sum(ly.get("gain", 0.5) for ly in b.get("layers", [])) for b in chunk
-            ) / max(len(chunk), 1)
-            energy_trajectory.append(round(avg, 2))
+        palette[role] = picked["path"]
+        print(f"  Swapped {role} -> {picked['name']}")
         return json.dumps(
             {
-                "bars_summarized": len(recent),
-                "role_frequency": role_counts,
-                "energy_per_4bars": energy_trajectory,
-                "last_4_bars": recent[-4:],
+                "swapped": role,
+                "to": picked["name"],
+                "active": list(loaded_samples.keys()),
             }
         )
-
-    def check_feedback() -> str:
-        """Check for trajectory and critic feedback. Call this between bar groups.
-        Returns: feedback text, or 'none' if no feedback pending."""
-        if not pending_feedback:
-            return "none"
-        result = "\n".join(pending_feedback)
-        pending_feedback.clear()
-        return result
 
     # --- Signal handling ---
     def _shutdown(signum, frame):
@@ -643,22 +701,12 @@ def run_dj(
         print(f"Will stop after {max_bars} bars.")
     print("Press Ctrl+C to stop.\n")
 
-    pattern_vars = "\n".join(f"{k} = {v}" for k, v in BEAT_PATTERNS.items())
-    instructions = (
-        DJ_INSTRUCTIONS
-        + f"\nLoaded roles: {list(loaded_samples.keys())}\n\n# Available as variables:\n{pattern_vars}"
-    )
+    instructions = DJ_INSTRUCTIONS + f"\nLoaded roles: {list(loaded_samples.keys())}"
 
     signature = dspy.Signature(DJ_SIGNATURE, instructions=instructions)
     rlm = dspy.RLM(
         signature,
-        tools=[
-            swap_sample,
-            render_and_play_bar,
-            get_history,
-            check_feedback,
-            list_alternatives,
-        ],
+        tools=[play, breakdown, add, remove, fader, pattern, mute, unmute, swap],
         max_iterations=100,
         max_llm_calls=500,
         verbose=verbose,
