@@ -328,21 +328,23 @@ You are a Berghain resident DJ. The room breathes — layers enter and leave,
 gains shift constantly, the groove evolves every few bars. A flat mix
 clears the dance floor.
 
-# Setup — add channels, then enter your loop
+# Setup — build momentum through rapid layering
 add("kick", "0.92", "four_on_floor")
 play("4")
 add("hihat", "0.55", "offbeat_8ths")
-add("bassline", "0.65", type="loop")
 play("4")
+add("bassline", "0.65", type="loop")
 fader("bassline", "0.72")
+play("4")
 add("perc", "0.40", "syncopated_a")
 add("texture", "0.30", type="loop")
+play("4")
 add("clap", "0.45", "backbeat")
 play("4")                                  # all 6 channels on
 
-# Main loop — ALWAYS evolve between play() calls
+# Main loop — MANDATORY: make 2-3 mixer moves between EVERY play() call
 while True:
-    status = json.loads(play("4"))
+    status = json.loads(play("8"))
     feedback = status.get("feedback")
 
     if feedback:
@@ -350,36 +352,39 @@ while True:
             f"Feedback: {feedback}\\n"
             f"Mixer: {json.dumps(status['mixer'])}\\n"
             f"Phase: {status['phase']}, Energy: {status['energy']}\\n"
-            "Suggest ONE mixer action. Be specific: fader/pattern/swap/add/remove/mute/breakdown."
+            "Respond with precise mixer command. Examples: fader('hihat', '0.58'), pattern('perc', 'gallop'), swap('texture', 'random'), breakdown('4'), mute('clap'). Be surgical."
         )
         # Parse direction and apply it
 
-    # ALWAYS tweak between phrases — pick from:
-    # fader("hihat", "0.50")     — nudge gain ±0.05
-    # pattern("perc", "gallop")  — shift the rhythm
-    # swap("hihat", "random")    — refresh a stale sound
+    # MANDATORY: Execute 2-3 mixer moves every phrase — prioritize pattern() and swap():
+    # pattern("perc", "gallop")  — shift the rhythm (USE FREQUENTLY)
+    # swap("hihat", "random")    — refresh a stale sound (USE FREQUENTLY)
+    # fader("hihat", "0.58")     — nudge gain ±0.03-0.08
     # breakdown("4")             — tension moment (use sparingly)
     # mute("texture")            — create space
+    # Example: pattern("perc", "syncopated_b") + swap("texture", "random") + fader("kick", "0.93")
 
 # Feedback response guide
-# "build up"  → add() or unmute() a channel
-# "strip back" → mute() or remove() a channel
-# "stagnant"  → pattern(), swap(), or breakdown()
-# CRITIC      → follow literally (specific roles + values)
+# "build up"  → add() new channel or unmute() existing + fader() boost
+# "strip back" → mute() non-essential or remove() + fader() cuts
+# "stagnant"  → pattern() + swap() combo or breakdown() for reset
+# "too busy"  → mute() texture/perc layers + fader() reductions
+# "needs energy" → pattern() to sixteenth_drive + fader() boosts
+# CRITIC      → execute exact command given
 
 # Phase targets (active channels)
 # intro: 1-2 | building: 3-4 | peak: 4-6 | stripping: 2-3 | outro: 1
 
-# Gain ranges
-# kick: 0.90-0.95 | hihat: 0.50-0.65 | bassline: 0.60-0.75
-# perc: 0.35-0.50 | texture: 0.30-0.50 | clap: 0.40-0.55
+# Gain ranges — tighter control for precision
+# kick: 0.90-0.94 | hihat: 0.52-0.62 | bassline: 0.62-0.72
+# perc: 0.37-0.47 | texture: 0.30-0.45 | clap: 0.42-0.52
 
 # Patterns: four_on_floor, offbeat_8ths, syncopated_a, syncopated_b,
 #   backbeat, sparse_accent, gallop, sixteenth_drive
 
 # Rules
-# - play("4") is one phrase. ALWAYS make a mixer move between phrases.
-# - play() blocks — it IS your clock. No time.sleep().
+# - play("8") is one phrase. MANDATORY: 2-3 mixer moves between phrases.
+# - play() blocks — it IS your only clock and timing mechanism.
 # - Variables persist — do NOT redeclare them.
 # - Call SUBMIT("done") only when stopping.
 """
@@ -395,6 +400,7 @@ def run_dj(
     max_bars: int | None = None,
     critic_lm: str | None = None,
     palette_file: str | None = None,
+    prompt_file: str | None = None,
 ) -> None:
     """Build tools, configure DSPy, invoke RLM, handle shutdown."""
     load_dotenv()
@@ -701,7 +707,13 @@ def run_dj(
         print(f"Will stop after {max_bars} bars.")
     print("Press Ctrl+C to stop.\n")
 
-    instructions = DJ_INSTRUCTIONS + f"\nLoaded roles: {list(loaded_samples.keys())}"
+    if prompt_file:
+        with open(prompt_file) as f:
+            base_instructions = f.read()
+        print(f"Using custom prompt from {prompt_file}")
+    else:
+        base_instructions = DJ_INSTRUCTIONS
+    instructions = base_instructions + f"\nLoaded roles: {list(loaded_samples.keys())}"
 
     signature = dspy.Signature(DJ_SIGNATURE, instructions=instructions)
     rlm = dspy.RLM(

@@ -8,8 +8,12 @@ dependencies = [
     "av>=16.1.0",
     "click>=8.0",
     "dspy-ai>=2.6",
+    "litellm>=1.0",
     "numpy>=1.26",
+    "pandas>=2.0",
     "pydub>=0.25.1",
+    "python-dotenv>=1.0",
+    "scipy>=1.11",
     "sounddevice>=0.5",
 ]
 
