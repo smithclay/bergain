@@ -9,17 +9,64 @@ controls instead of building JSON layer arrays.
 
 import copy
 import json
+import logging
 import random
 import signal
-import sys
 from collections import defaultdict
 
 import dspy
 from dotenv import load_dotenv
+from dspy.primitives.python_interpreter import PythonInterpreter
 
 from bergain.indexer import build_index
 from bergain.renderer import load_palette, render_bar
 from bergain.streamer import AudioStreamer
+
+logger = logging.getLogger(__name__)
+
+
+class ResilientInterpreter(PythonInterpreter):
+    """PythonInterpreter that re-registers tools on every execute() and logs crashes."""
+
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self._last_code = None
+        self._exec_count = 0
+
+    def _ensure_deno_process(self):
+        if self.deno_process is not None and self.deno_process.poll() is not None:
+            stderr = self.deno_process.stderr.read() if self.deno_process.stderr else ""
+            # Try to drain any remaining stdout for clues
+            remaining_stdout = ""
+            try:
+                import select
+
+                if (
+                    self.deno_process.stdout
+                    and select.select([self.deno_process.stdout], [], [], 0)[0]
+                ):
+                    remaining_stdout = self.deno_process.stdout.read()
+            except Exception:
+                pass
+            logger.warning(
+                "Deno sandbox died (exit %d) after %d executions.\n"
+                "  last code: %s\n"
+                "  stderr: %s\n"
+                "  remaining stdout: %s",
+                self.deno_process.returncode,
+                self._exec_count,
+                (self._last_code or "")[:500],
+                stderr[:2000],
+                remaining_stdout[:1000],
+            )
+        super()._ensure_deno_process()
+
+    def execute(self, code, variables=None):
+        self._tools_registered = False
+        self._last_code = code
+        self._exec_count += 1
+        return super().execute(code, variables)
+
 
 DEFAULT_ROLES = ["kick", "hihat", "bassline", "perc", "texture", "clap"]
 
@@ -237,13 +284,30 @@ def _compute_critique(
     if variance > 0.5:
         observations.append("energy is unstable — hold a steady level longer")
 
-    # Repetition
+    # Repetition — compare phrase-level snapshots, not individual bars
+    # (bars within a single play() call share mixer state, so they're always identical)
     specs = [json.dumps(b, sort_keys=True) for b in recent]
-    unique_ratio = len(set(specs)) / len(specs)
-    if unique_ratio < 0.2:
-        observations.append("mix is stagnant — introduce a variation")
-    elif unique_ratio > 0.9:
-        observations.append("too much variation — repeat patterns longer")
+    stride = max(CRITIQUE_INTERVAL, 1)
+    phrase_specs = specs[::stride] if len(specs) >= stride else specs
+    unique_ratio = len(set(phrase_specs)) / max(len(phrase_specs), 1)
+    if len(phrase_specs) >= 2 and unique_ratio < 0.5:
+        # Check history further back for persistent stagnation
+        if len(history) >= CRITIQUE_INTERVAL * 3:
+            older = [
+                json.dumps(b, sort_keys=True) for b in history[-CRITIQUE_INTERVAL * 3 :]
+            ]
+            older_phrases = older[::stride]
+            older_unique = len(set(older_phrases)) / max(len(older_phrases), 1)
+            if older_unique < 0.5:
+                observations.append(
+                    "mix STILL stagnant after multiple phrases — STOP tweaking faders. "
+                    "Do something structural: swap samples, try a breakdown(), "
+                    "drop a layer and rebuild, or diagnose why energy isn't moving"
+                )
+            else:
+                observations.append("mix is stagnant — introduce a variation")
+        else:
+            observations.append("mix is stagnant — introduce a variation")
 
     # Kick presence
     kick_pct = sum(
@@ -268,7 +332,10 @@ def _compute_critique(
 
 
 def _llm_critique(
-    history: list[dict], total_bars_played: int, lm: dspy.LM
+    history: list[dict],
+    total_bars_played: int,
+    lm: dspy.LM,
+    total_bars: int | None = None,
 ) -> str | None:
     """Ask an LM to critique the recent DJ set."""
     window = min(LLM_CRITIC_INTERVAL, len(history))
@@ -289,23 +356,47 @@ def _llm_critique(
     # Last 4 bars as concrete examples
     last_4 = json.dumps(recent[-4:], indent=1)
 
+    # Count active layers and groove changes for context
+    active_layers = len(recent[-1].get("layers", [])) if recent else 0
+    bar_snapshots = [json.dumps(b, sort_keys=True) for b in recent]
+    unique_snapshots = len(set(bar_snapshots))
+    changes_per_phrase = unique_snapshots / max(window // 8, 1)
+
+    # Phase awareness
+    _, phase = _phase_at(total_bars_played, total_bars)
+    phase_guidance = {
+        "intro phase": "We're in the INTRO. Suggest adding one element to start building.",
+        "building phase": "We're BUILDING. Suggest adding layers or subtle adjustments to increase density.",
+        "full groove phase": "We're at the PEAK. Keep it dense. Suggest holding, a fader ride, or ONE breakdown for tension/release.",
+        "stripping phase": "We're STRIPPING DOWN. Suggest removing/muting layers. Do NOT suggest adding anything.",
+        "outro phase": "We're in the OUTRO. Suggest continuing to strip toward kick-only. Do NOT suggest adding layers.",
+        "infinite": "Open-ended set. Match advice to current density.",
+    }
+    phase_hint = phase_guidance.get(phase, "")
+
     prompt = f"""\
-You are a Berghain resident DJ reviewing a set in progress (bar {total_bars_played}, reviewing last {window} bars).
+You are a Berghain resident DJ reviewing a set in progress (bar {total_bars_played}{f" of {total_bars}" if total_bars else ""}, phase: {phase}, reviewing last {window} bars).
 
 Energy per bar: {energies}
 Role usage: {json.dumps(role_counts)}
+Active layers right now: {active_layers}
 Last 4 bars: {last_4}
+Groove changes: {unique_snapshots} distinct states in {window} bars ({changes_per_phrase:.1f} per phrase)
+
+{phase_hint}
 
 Give ONE specific, actionable direction for the next 8-16 bars.
-Express it as concrete actions the DJ can take:
-- Change a role's gain (e.g., "drop hihat gain to 0.3 for 8 bars")
-- Change beat positions (e.g., "move perc from backbeat to syncopated")
-- Swap a sample (e.g., "swap hihat for something brighter")
-- Add/remove a layer (e.g., "drop texture for 4 bars, then bring it back")
-Be specific about timing (how many bars) and which roles to change."""
+Match your advice to BOTH the phase and density:
+- Intro/building + sparse: suggest ADDING a layer.
+- Building + 3-4 layers: suggest adding one more OR a fader ride (slow gain change over 8 bars).
+- Peak + dense: suggest holding the groove, a fader ride, or a breakdown for tension/release.
+- Stripping/outro: suggest MUTING or REMOVING layers (never fade to 0.00). Never add during strip/outro.
+- Changing too often (>3/phrase): suggest "hold the current groove."
+Fader rides (e.g., "slowly raise hihat from 0.50 to 0.65 over 8 bars") add movement without structural changes.
+Express direction as concrete actions with timing (how many bars) and which roles."""
 
     try:
-        response = lm(prompt, temperature=0.9)
+        response = lm(prompt, temperature=1.0)
         # dspy.LM may return list of strings or list of dicts
         item = response[0] if isinstance(response, list) else response
         if isinstance(item, dict):
@@ -324,70 +415,152 @@ Be specific about timing (how many bars) and which roles to change."""
 DJ_SIGNATURE = "sample_menu -> final_status"
 
 DJ_INSTRUCTIONS = """\
-You are a Berghain resident DJ. The room breathes — layers enter and leave,
-gains shift constantly, the groove evolves every few bars. A flat mix
-clears the dance floor.
+You are a Berghain resident DJ. Your job is to create a hypnotic, emotionally
+compelling techno set — not to write careful software.
 
-# Setup — build momentum through rapid layering
-add("kick", "0.92", "four_on_floor")
-play("4")
-add("hihat", "0.55", "offbeat_8ths")
-play("4")
-add("bassline", "0.65", type="loop")
-fader("bassline", "0.72")
-play("4")
-add("perc", "0.40", "syncopated_a")
-add("texture", "0.30", type="loop")
-play("4")
-add("clap", "0.45", "backbeat")
-play("4")                                  # all 6 channels on
+# ── MUSICAL PHILOSOPHY ──
+# The dance floor responds to GROOVE, not to cleverness.
+#
+# GROOVE HIERARCHY (this is your entire job):
+#   1. LOCK a groove — kick + one element, let it breathe 8-16 bars
+#   2. RIDE it — hold what's working. Resist the urge to touch anything.
+#   3. EVOLVE — 1-2 changes per phrase (8 bars). Add OR adjust, not both.
+#   4. BREAK — strip to kick only (breakdown). THIS is where tension lives.
+#   5. DROP — bring layers back. The return IS the emotional payoff.
+#
+# HYPNOTIC REPETITION is the point. A groove held for 16 bars is not stagnation
+# — it's the thing that makes the breakdown hit. If you're changing 3+ things
+# every phrase, you're fidgeting, not DJing.
+#
+# SUBTRACTIVE MIXING is your secret weapon — but only once you've BUILT
+# something worth stripping. You need 4-5 layers before a breakdown hits hard.
+# Use breakdown() deliberately — it's your strongest emotional tool, but only
+# after the groove is fully developed.
+#
+# PACING RULES:
+#   - 1-2 changes per phrase during BUILD. Fader nudges don't count.
+#   - During PEAK: hold the groove. Maybe one fader nudge per phrase.
+#   - After a breakdown, bring layers back across 2-3 phrases (not all at once)
+#
+# ENERGY ARC SHAPES (pick one and commit):
+#   Hill:  build slowly → peak → strip slowly → end sparse
+#   Ramp:  start minimal → build relentlessly → peak at the end
+#   Wave:  build → strip → build higher → strip → final peak
+#
+# FADER DYNAMICS — movement without structural changes:
+#   Ride faders for subtle energy shifts within a groove:
+#   - Raise hihat from 0.50 → 0.65 over two phrases to build energy
+#   - Drop texture from 0.40 → 0.28 to create space before a breakdown
+#   - Nudge bassline gain up 0.05 each phrase during the build
+#   NEVER fade to 0.00 — that's a silent ghost channel. Use mute() or remove()
+#   to actually take a layer out. Fader rides stay WITHIN the gain range.
+#   NEVER mute then unmute the same channel within 16 bars — that's indecisive.
+#
+# WHAT KILLS THE VIBE:
+#   ✗ Fidgeting — changing gains/patterns every play() call
+#   ✗ Front-loading — adding 4+ layers in the first 16 bars
+#   ✗ No breakdowns — all build, no release = no emotional payoff
+#   ✗ Mute/unmute oscillation — muting then unmuting within 16 bars sounds broken
+#   ✗ Random swaps — changing samples without musical reason
+#   ✗ Over-engineering — writing 50 lines of code per iteration instead of DJing
 
-# Main loop — MANDATORY: make 2-3 mixer moves between EVERY play() call
-while True:
-    status = json.loads(play("8"))
-    feedback = status.get("feedback")
+# ── TOOL REFERENCE ──
+#   play(bars)              — advance N bars, returns JSON status. YOUR ONLY CLOCK.
+#   breakdown(bars)         — mute all but kick for N bars, auto-restore. USE THIS.
+#   add(role, gain, pattern) — add channel. Pattern = named pattern string (see below).
+#   remove(role)            — drop channel permanently
+#   fader(role, gain)       — adjust volume (gain as string, e.g. "0.58")
+#   pattern(role, name)     — change beat pattern
+#   swap(role, choice)      — "" to LIST, index string to SWAP, "random" for random
+#   mute(role)/unmute(role) — toggle without losing settings
+#   llm_query(prompt)       — ask sub-LM for creative judgment
+#   llm_query_batched(prompts) — parallel sub-LM calls
+#
+#   Roles: kick, hihat, bassline, perc, texture, clap
+#   Patterns: four_on_floor, offbeat_8ths, syncopated_a, syncopated_b,
+#             backbeat, sparse_accent, gallop, sixteenth_drive
+#   Gains: kick 0.82-1.00 | hihat 0.47-0.67 | bassline 0.57-0.77
+#          perc 0.32-0.52 | texture 0.28-0.48 | clap 0.37-0.57
 
-    if feedback:
-        direction = llm_query(
-            f"Feedback: {feedback}\\n"
-            f"Mixer: {json.dumps(status['mixer'])}\\n"
-            f"Phase: {status['phase']}, Energy: {status['energy']}\\n"
-            "Respond with precise mixer command. Examples: fader('hihat', '0.58'), pattern('perc', 'gallop'), swap('texture', 'random'), breakdown('4'), mute('clap'). Be surgical."
-        )
-        # Parse direction and apply it
+# ── SAFETY ESSENTIALS ──
+# Pattern arg in add()/pattern() MUST be a named pattern — NEVER a filename.
+#   WRONG: add("kick", "0.90", "909-Bassdrum.wav")  ← CRASHES sandbox
+#   RIGHT: add("kick", "0.90", "four_on_floor") then swap("kick", "3")
+# ALWAYS store play() return: status = json.loads(play("8"))
+# NEVER hardcode mixer state from memory — read it from the status variable.
+# NEVER use eval()/exec() on llm_query output — parse JSON, dispatch explicitly.
+# If a tool errors, try once simpler, then skip it. Keep playing.
+# If tools are missing (NameError), call SUBMIT("done") immediately.
+# Keep iterations SHORT: 10-20 lines. You are DJing, not engineering.
+# Variables persist across iterations — don't redeclare imports or state.
+# swap() with sample index: use clean strings like "3", never filenames.
 
-    # MANDATORY: Execute 2-3 mixer moves every phrase — prioritize pattern() and swap():
-    # pattern("perc", "gallop")  — shift the rhythm (USE FREQUENTLY)
-    # swap("hihat", "random")    — refresh a stale sound (USE FREQUENTLY)
-    # fader("hihat", "0.58")     — nudge gain ±0.03-0.08
-    # breakdown("4")             — tension moment (use sparingly)
-    # mute("texture")            — create space
-    # Example: pattern("perc", "syncopated_b") + swap("texture", "random") + fader("kick", "0.93")
+# ── DJ SET STRUCTURE ──
+# FIRST ITERATION: explore sample_menu. Print categories, counts, names.
+#   Note interesting sample indices. Ask llm_query for an opening vibe.
+#
+# INTRO (bars 1-16): Kick alone for 8 bars. Add hihat or perc. Let it breathe.
+# BUILD (bars 16-64): ADD a new element every 8 bars. You MUST reach 4-5
+#   active layers by bar 48. Add bassline, perc, texture, clap — keep building.
+#   The set needs density before breakdowns have any impact.
+# PEAK (bars 64-96): 4-6 layers running. HOLD the groove — don't strip yet.
+#   This is the payoff. Maybe swap a sample or nudge a fader, but keep it full.
+# BREAKDOWN (bar ~80): NOW strip to kick for 4-8 bars. The impact comes from
+#   the contrast with the dense peak. Bring layers back over 2-3 phrases.
+# STRIP (bars 96-112): Remove layers one at a time toward the outro.
+# OUTRO (bars 112+): Fade to kick alone. Let the room breathe out.
+#
+# KEY: build UP during build phase, HOLD during peak, strip LATE.
+# A breakdown at bar 24 with only 2 layers has zero impact.
+#
+# RESPONDING TO FEEDBACK:
+#   "energy rising" → good if building, otherwise mute a layer
+#   "energy falling" → good if stripping, otherwise check if you dropped too much
+#   "stagnant" → you've been holding TOO long. Do something structural.
+#   "unstable" → stop changing things. Lock the groove. play("16").
+#   CRITIC feedback → read it, but don't obey blindly. You're the DJ.
+#
+# When the set reaches max_bars or a natural end, call SUBMIT("done").
 
-# Feedback response guide
-# "build up"  → add() new channel or unmute() existing + fader() boost
-# "strip back" → mute() non-essential or remove() + fader() cuts
-# "stagnant"  → pattern() + swap() combo or breakdown() for reset
-# "too busy"  → mute() texture/perc layers + fader() reductions
-# "needs energy" → pattern() to sixteenth_drive + fader() boosts
-# CRITIC      → execute exact command given
-
-# Phase targets (active channels)
-# intro: 1-2 | building: 3-4 | peak: 4-6 | stripping: 2-3 | outro: 1
-
-# Gain ranges — tighter control for precision
-# kick: 0.90-0.94 | hihat: 0.52-0.62 | bassline: 0.62-0.72
-# perc: 0.37-0.47 | texture: 0.30-0.45 | clap: 0.42-0.52
-
-# Patterns: four_on_floor, offbeat_8ths, syncopated_a, syncopated_b,
-#   backbeat, sparse_accent, gallop, sixteenth_drive
-
-# Rules
-# - play("8") is one phrase. MANDATORY: 2-3 mixer moves between phrases.
-# - play() blocks — it IS your only clock and timing mechanism.
-# - Variables persist — do NOT redeclare them.
-# - Call SUBMIT("done") only when stopping.
+Input: `sample_menu` — your record bag. Explore it before you play it.
+Output: {final_status} via SUBMIT() when the set concludes.
 """
+
+
+def _dump_lm_history(main_lm, cheap_lm, path: str) -> None:
+    """Write full LLM prompt/response history to a JSONL file."""
+    entries = []
+    seen_lms = set()
+    for lm, label in [(main_lm, "main"), (cheap_lm, "critic")]:
+        if id(lm) in seen_lms:
+            continue
+        seen_lms.add(id(lm))
+        for item in getattr(lm, "history", []):
+            entries.append(
+                {
+                    "role": label,
+                    "model": item.get("model", ""),
+                    "timestamp": item.get("timestamp", ""),
+                    "prompt": item.get("prompt"),
+                    "messages": item.get("messages"),
+                    "outputs": item.get("outputs", []),
+                    "usage": item.get("usage", {}),
+                }
+            )
+    entries.sort(key=lambda e: e.get("timestamp", ""))
+    try:
+        with open(path, "w") as f:
+            for entry in entries:
+                f.write(json.dumps(entry, default=str) + "\n")
+        print(f"LLM history ({len(entries)} calls) saved to {path}")
+    except Exception as e:
+        print(f"Failed to write LLM history: {e}")
+
+
+class _DJComplete(Exception):
+    """Raised when the DJ reaches its max-bars limit."""
+
+    pass
 
 
 def run_dj(
@@ -442,6 +615,22 @@ def run_dj(
     bar_history: list[dict] = []
     mixer_state: dict[str, dict] = {}
 
+    interpreter = ResilientInterpreter()
+    cleanup_done = [False]
+
+    def _cleanup():
+        if cleanup_done[0]:
+            return
+        cleanup_done[0] = True
+        interpreter.shutdown()
+        if hasattr(streamer, "drain"):
+            streamer.drain()
+        streamer.stop()
+        print(f"Total bars played: {bars_played[0]}")
+        if output:
+            history_path = output.rsplit(".", 1)[0] + ".llm_history.jsonl"
+            _dump_lm_history(main_lm, cheap_lm, history_path)
+
     # --- Internal helpers (closures over shared state) ---
 
     def _mixer_snapshot() -> dict:
@@ -453,9 +642,15 @@ def run_dj(
         return json.dumps({**data, "mixer": _mixer_snapshot()})
 
     def _render_bars(n: int) -> list[str]:
-        """Render N bars from current mixer state. Returns corrections."""
+        """Render N bars from current mixer state. Returns corrections.
+
+        Stops early (without raising) if max_bars is reached.
+        """
         all_corrections: list[str] = []
         for _ in range(n):
+            if max_bars and bars_played[0] >= max_bars:
+                break
+
             layers = _mixer_to_layers(mixer_state)
             bar_spec = {"layers": copy.deepcopy(layers)}
 
@@ -475,14 +670,7 @@ def run_dj(
             all_corrections.extend(corrections)
 
             if max_bars and bars_played[0] >= max_bars:
-                print(f"\nReached {max_bars}-bar limit. Draining buffer...")
-                if hasattr(streamer, "drain"):
-                    streamer.drain()
-                streamer.stop()
-                print(f"Total bars played: {bars_played[0]}")
-                import os
-
-                os._exit(0)
+                print(f"\nReached {max_bars}-bar limit.")
         return all_corrections
 
     def _build_status(all_corrections: list[str], count: int) -> str:
@@ -494,7 +682,9 @@ def run_dj(
                 feedback_items.append(f"TRAJECTORY: {critique}")
                 print(f"  >> TRAJECTORY: {critique}")
         if bars_played[0] % LLM_CRITIC_INTERVAL == 0:
-            llm_feedback = _llm_critique(bar_history, bars_played[0], cheap_lm)
+            llm_feedback = _llm_critique(
+                bar_history, bars_played[0], cheap_lm, max_bars
+            )
             if llm_feedback:
                 feedback_items.append(f"CRITIC: {llm_feedback}")
                 print(f"  >> CRITIC: {llm_feedback}")
@@ -526,10 +716,20 @@ def run_dj(
     def play(bars: str = "4") -> str:
         """Advance the mix by N bars. Returns JSON status with bars_played,
         phase, energy, target_energy, corrections, feedback, mixer,
-        buffer_depth."""
+        buffer_depth.  When the set reaches max_bars, the status includes
+        set_complete=true — call SUBMIT('done') immediately."""
         n = int(bars)
         all_corrections = _render_bars(n)
-        return _build_status(all_corrections, n)
+        status_str = _build_status(all_corrections, n)
+        if max_bars and bars_played[0] >= max_bars:
+            status = json.loads(status_str)
+            status["set_complete"] = True
+            status["feedback"] = (
+                "SET COMPLETE — you have reached the bar limit. "
+                'Call SUBMIT("done") NOW.'
+            )
+            return json.dumps(status)
+        return status_str
 
     def breakdown(bars: str = "4") -> str:
         """Mute all channels except kick for N bars, then auto-restore.
@@ -597,9 +797,16 @@ def run_dj(
         """Adjust a channel's volume. Returns JSON with mixer snapshot."""
         if role not in mixer_state:
             return json.dumps({"error": f"No channel '{role}' on mixer"})
-        mixer_state[role]["gain"] = float(gain)
+        g = float(gain)
+        if g <= 0.0:
+            return json.dumps(
+                {
+                    "error": f"Gain must be > 0. Use mute('{role}') or remove('{role}') to silence a channel."
+                }
+            )
+        mixer_state[role]["gain"] = g
         print(f"  >> Fader: {role} -> {gain}")
-        return _respond(role=role, gain=float(gain))
+        return _respond(role=role, gain=g)
 
     def pattern(role: str, name_or_array: str) -> str:
         """Change a channel's beat pattern. Accepts named patterns or JSON
@@ -696,8 +903,7 @@ def run_dj(
     # --- Signal handling ---
     def _shutdown(signum, frame):
         print("\nShutting down DJ...")
-        streamer.stop()
-        sys.exit(0)
+        raise KeyboardInterrupt
 
     signal.signal(signal.SIGINT, _shutdown)
 
@@ -723,13 +929,13 @@ def run_dj(
         max_llm_calls=500,
         verbose=verbose,
         sub_lm=cheap_lm,
+        interpreter=interpreter,
     )
 
     try:
         result = rlm(sample_menu=role_map_json)
         print(f"\nDJ set finished: {result.final_status}")
     except KeyboardInterrupt:
-        print("\nDJ set interrupted.")
+        pass
     finally:
-        streamer.stop()
-        print(f"Total bars played: {bars_played[0]}")
+        _cleanup()
