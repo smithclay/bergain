@@ -1,17 +1,6 @@
-.DS_Store
-
-# Python-generated files
 __pycache__/
-*.py[oc]
-build/
-dist/
-wheels/
-*.egg-info
+*.pyc
+.venv/
 .env
-
-# Virtual environments
-.venv
-
-# Output artifacts
+.DS_Store
 output/
-sample_pack/
