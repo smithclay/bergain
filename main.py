@@ -10,6 +10,7 @@ import threading
 import time
 from pythonosc.osc_message_builder import OscMessageBuilder
 from pythonosc.osc_message import OscMessage
+from spec_data import spec as _ableton_spec
 
 REMOTE_PORT = 11000
 LOCAL_PORT = 11001
@@ -92,6 +93,126 @@ class AbletonOSC:
         self._thread.join()
 
 
+class DomainProxy:
+    """Proxy for a non-indexed AbletonOSC domain (song, view, browser, etc.)."""
+
+    def __init__(self, osc, domain, addresses):
+        self._osc = osc
+        self._domain = domain
+        self._addresses = addresses
+
+    def _validate(self, address):
+        if address not in self._addresses:
+            raise ValueError(f"Unknown address: {address}")
+
+    def get(self, prop):
+        address = f"/live/{self._domain.name}/get/{prop}"
+        self._validate(address)
+        result = self._osc.query(address)
+        values = result[len(self._domain.index_params) :]
+        return values[0] if len(values) == 1 else values
+
+    def set(self, prop, *args):
+        address = f"/live/{self._domain.name}/set/{prop}"
+        self._validate(address)
+        self._osc.send(address, list(args))
+
+    def call(self, method, *args):
+        address = f"/live/{self._domain.name}/{method}"
+        self._validate(address)
+        self._osc.send(address, list(args))
+
+    def query(self, method, *args):
+        address = f"/live/{self._domain.name}/{method}"
+        self._validate(address)
+        result = self._osc.query(address, list(args))
+        return result[len(self._domain.index_params) :]
+
+
+class IndexedDomainProxy:
+    """Proxy for an indexed AbletonOSC domain with indices bound up front."""
+
+    def __init__(self, osc, domain, addresses, indices):
+        self._osc = osc
+        self._domain = domain
+        self._addresses = addresses
+        self._indices = list(indices)
+
+    def _validate(self, address):
+        if address not in self._addresses:
+            raise ValueError(f"Unknown address: {address}")
+
+    def get(self, prop):
+        address = f"/live/{self._domain.name}/get/{prop}"
+        self._validate(address)
+        result = self._osc.query(address, self._indices)
+        values = result[len(self._domain.index_params) :]
+        return values[0] if len(values) == 1 else values
+
+    def set(self, prop, *args):
+        address = f"/live/{self._domain.name}/set/{prop}"
+        self._validate(address)
+        self._osc.send(address, self._indices + list(args))
+
+    def call(self, method, *args):
+        address = f"/live/{self._domain.name}/{method}"
+        self._validate(address)
+        self._osc.send(address, self._indices + list(args))
+
+    def query(self, method, *args):
+        address = f"/live/{self._domain.name}/{method}"
+        self._validate(address)
+        result = self._osc.query(address, self._indices + list(args))
+        return result[len(self._domain.index_params) :]
+
+
+class LiveAPI:
+    """High-level wrapper around AbletonOSC with domain-scoped proxies.
+
+    Non-indexed domains are direct attributes:
+        api.song.set("tempo", 128.0)
+        api.browser.call("load_instrument", "Drift")
+
+    Indexed domains are callable, binding indices up front:
+        api.clip_slot(0, 0).call("fire")
+        api.clip(0, 0).set("name", "Drums")
+    """
+
+    def __init__(self, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT):
+        self._osc = AbletonOSC(hostname, port, client_port)
+        self._spec = _ableton_spec
+        self._addresses = {ep.address for d in self._spec.domains for ep in d.endpoints}
+        self._domains = {d.name: d for d in self._spec.domains}
+        for domain in self._spec.domains:
+            if not domain.index_params:
+                setattr(
+                    self, domain.name, DomainProxy(self._osc, domain, self._addresses)
+                )
+
+    def _indexed(self, name, *indices):
+        return IndexedDomainProxy(
+            self._osc, self._domains[name], self._addresses, indices
+        )
+
+    def track(self, track_id):
+        return self._indexed("track", track_id)
+
+    def clip(self, track_id, clip_id):
+        return self._indexed("clip", track_id, clip_id)
+
+    def clip_slot(self, track_id, clip_id):
+        return self._indexed("clip_slot", track_id, clip_id)
+
+    def device(self, track_id, device_id):
+        return self._indexed("device", track_id, device_id)
+
+    def scene(self, scene_id):
+        return self._indexed("scene", scene_id)
+
+    def stop(self):
+        self._osc.stop()
+
+
 # ---------------------------------------------------------------------------
 # Pattern generators
 # ---------------------------------------------------------------------------
@@ -148,40 +269,40 @@ def make_bass(bars=4):
 # ---------------------------------------------------------------------------
 
 
-def create_clip(osc, track, slot, length, notes, name):
+def create_clip(api, track, slot, length, notes, name):
     """Create a MIDI clip, populate it with notes, and name it."""
-    has_clip = osc.query("/live/clip_slot/get/has_clip", (track, slot), timeout=1.0)
-    if has_clip[2]:
-        osc.send("/live/clip_slot/delete_clip", (track, slot))
+    cs = api.clip_slot(track, slot)
+    if cs.get("has_clip"):
+        cs.call("delete_clip")
         time.sleep(0.1)
 
-    osc.send("/live/clip_slot/create_clip", (track, slot, float(length)))
+    cs.call("create_clip", float(length))
     time.sleep(0.1)
 
-    osc.send("/live/clip/add/notes", [track, slot] + notes)
-    osc.send("/live/clip/set/name", [track, slot, name])
+    api.clip(track, slot).call("add/notes", *notes)
+    api.clip(track, slot).set("name", name)
     print(
         f"  Track {track}, slot {slot}: '{name}' ({length} beats, {len(notes) // 5} notes)"
     )
 
 
-def load_instrument(osc, track, name):
+def load_instrument(api, track, name):
     """Select a track and load an instrument by name via the browser API."""
-    osc.send("/live/view/set/selected_track", [track])
+    api.view.set("selected_track", track)
     time.sleep(0.1)
-    osc.send("/live/browser/load_instrument", [name])
+    api.browser.call("load_instrument", name)
     time.sleep(1.0)
     print(f"  Track {track}: loaded '{name}'")
 
 
-def load_drum_kit(osc, track, name=None):
+def load_drum_kit(api, track, name=None):
     """Select a track and load a drum kit via the browser API."""
-    osc.send("/live/view/set/selected_track", [track])
+    api.view.set("selected_track", track)
     time.sleep(0.1)
     if name:
-        osc.send("/live/browser/load_drum_kit", [name])
+        api.browser.call("load_drum_kit", name)
     else:
-        osc.send("/live/browser/load_drum_kit", [])
+        api.browser.call("load_drum_kit")
     time.sleep(1.0)
     print(f"  Track {track}: loaded drum kit" + (f" '{name}'" if name else ""))
 
@@ -192,35 +313,35 @@ def load_drum_kit(osc, track, name=None):
 
 
 def main():
-    osc = AbletonOSC()
+    api = LiveAPI()
     bars = 4
     beats = bars * 4
     bpm = 128
 
     print(f"Setting tempo to {bpm} BPM...")
-    osc.send("/live/song/set/tempo", [float(bpm)])
+    api.song.set("tempo", float(bpm))
 
-    osc.send("/live/song/stop_playing")
+    api.song.call("stop_playing")
     time.sleep(0.2)
 
     # Load instruments via browser API
     print("\nLoading instruments...")
-    load_drum_kit(osc, track=0)
-    load_instrument(osc, track=1, name="Drift")
+    load_drum_kit(api, track=0)
+    load_instrument(api, track=1, name="Drift")
 
     # Create clips
     print(f"\nCreating {bars}-bar clips...")
     drum_notes = make_kick(bars) + make_hihat(bars) + make_clap(bars)
-    create_clip(osc, track=0, slot=0, length=beats, notes=drum_notes, name="Drums")
+    create_clip(api, track=0, slot=0, length=beats, notes=drum_notes, name="Drums")
 
     bass_notes = make_bass(bars)
-    create_clip(osc, track=1, slot=0, length=beats, notes=bass_notes, name="Bass")
+    create_clip(api, track=1, slot=0, length=beats, notes=bass_notes, name="Bass")
 
     # Fire and play
     print("\nFiring clips...")
-    osc.send("/live/clip_slot/fire", (0, 0))
-    osc.send("/live/clip_slot/fire", (1, 0))
-    osc.send("/live/song/start_playing")
+    api.clip_slot(0, 0).call("fire")
+    api.clip_slot(1, 0).call("fire")
+    api.song.call("start_playing")
     print("Playing! Press Ctrl+C to stop.")
 
     try:
@@ -228,9 +349,9 @@ def main():
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nStopping...")
-        osc.send("/live/song/stop_playing")
+        api.song.call("stop_playing")
 
-    osc.stop()
+    api.stop()
 
 
 if __name__ == "__main__":
