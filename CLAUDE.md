@@ -45,11 +45,12 @@ Indexing happens at runtime inside `generate` and `dj` (fast enough to not need 
 The `dj` command replaces the static recipe with a DSPy RLM invocation. The RLM's persistent REPL environment IS the DJ's brain — it writes its own loops, selects samples, and drives the audio pipeline through tool functions injected into its sandbox.
 
 Key mechanisms:
-- **Tools as closures** — `set_palette()`, `render_and_play_bar()`, `get_status()`, `get_history()` are closures over shared state (loaded samples, audio streamer, bar history)
-- **Backpressure** — `render_and_play_bar()` blocks when the audio queue is full, naturally pacing the RLM at playback speed
-- **Auto-guardrails** — `render_and_play_bar()` auto-caps texture/synth gains and trims density before rendering, so the RLM doesn't waste tokens on mechanical fixes
-- **Trajectory feedback** — every 16 bars, trajectory observations (energy slope, stagnation, density) are pushed to the RLM as creative guidance it can reason about
-- **Self-reflection** — the RLM periodically calls `get_history()` + `llm_query()` within its loop to get creative direction and evolve patterns
+- **Mixer-control tools** — `play()`, `add()`, `fader()`, `pattern()`, `mute()`/`unmute()`, `breakdown()`, `swap()` are closures over shared mixer state
+- **Backpressure** — `play()` blocks when the audio queue is full, naturally pacing the RLM at playback speed
+- **Auto-guardrails** — `_auto_correct_bar()` caps texture/synth gains and enforces position-aware density ceilings via `_ARC_PHASES`
+- **Trajectory feedback** — every 8 bars, trajectory observations (energy slope, stagnation, density) are injected into tool responses
+- **LLM critic** — every 16 bars, a cheap sub-LM provides phase-aware creative direction
+- **Loop auto-detection** — `add()` checks `role_map` to determine if a sample is a loop or oneshot, preventing the RLM from passing incorrect types
 - **Deno sandbox** — DSPy's PythonInterpreter runs code in Deno+Pyodide; tool functions execute on the host where pydub/sounddevice live
 
 ### Arrangement model (dict-based, JSON-serializable)
@@ -78,3 +79,14 @@ This model is designed so a future streaming player can read bars one-by-one.
 - All samples are resampled to mono at the arrangement's sample_rate during render
 - `sample_pack/` folder names map to categories via `CATEGORY_MAP` in indexer.py
 - RLM tool functions communicate via JSON strings (serializable across the Deno sandbox boundary)
+- See `RLM_LESSONS.md` for hard-won insights about using DSPy RLM for music generation
+
+## Scoring & Evaluation
+
+Audio quality is measured via a Modal-hosted audiobox-aesthetics endpoint:
+- **Metrics**: CE (Content Enjoyment), CU (Content Usefulness), PC (Production Complexity), PQ (Production Quality)
+- **Objective**: `OBJ = 0.60*CE + 0.05*CU + 0.05*PC + 0.30*PQ`
+- **Palette screening**: `scripts/screen_palettes.py` renders reference arrangements across random palettes
+- **Gap diagnostics**: `scripts/score_gap_test.py` isolates duration vs arc vs decision effects
+- **Parallel DJ runs**: `scripts/parallel_dj.sh` runs DJ across models/prompts with auto-scoring
+- Curated palettes live in `palettes/curated/` (top 10 from screening, OBJ 7.0+)

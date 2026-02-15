@@ -33,7 +33,7 @@ from bergain.dj import DJ_INSTRUCTIONS
 
 load_dotenv()
 
-DEFAULT_WEIGHTS = {"CE": 0.35, "CU": 0.15, "PC": 0.10, "PQ": 0.40}
+DEFAULT_WEIGHTS = {"CE": 0.60, "CU": 0.05, "PC": 0.05, "PQ": 0.30}
 DEFAULT_META_LM = "openrouter/anthropic/claude-sonnet-4"
 DEFAULT_DJ_LM = "openrouter/openai/gpt-5-mini"
 DEFAULT_CRITIC_LM = "openrouter/openai/gpt-5-nano"
@@ -49,6 +49,103 @@ KNOBS = [
     "feedback_response_style",
     "phase_targets",
 ]
+
+# ---------------------------------------------------------------------------
+# Template system: numeric params for grid search, creative params for meta-LLM
+# ---------------------------------------------------------------------------
+
+NUMERIC_PARAMS = {
+    "setup_phrase_bars": [2, 4, 8],
+    "loop_phrase_bars": [4, 8, 16],
+    "min_moves": [1, 2, 3, 4],
+    "gain_range_width": [0.05, 0.10, 0.15, 0.20],
+}
+
+DEFAULT_NUMERIC_PARAMS = {
+    "setup_phrase_bars": 4,
+    "loop_phrase_bars": 8,
+    "min_moves": 2,
+    "gain_range_width": 0.05,
+}
+
+BASE_GAINS = {
+    "kick": 0.92,
+    "hihat": 0.57,
+    "bassline": 0.67,
+    "perc": 0.42,
+    "texture": 0.375,
+    "clap": 0.47,
+}
+
+DEFAULT_CREATIVE_PARAMS = {
+    "persona": (
+        "You are a Berghain resident DJ. The room breathes — layers enter and leave,\n"
+        "gains shift constantly, the groove evolves every few bars. A flat mix\n"
+        "clears the dance floor."
+    ),
+    "feedback_style": (
+        "Respond with precise mixer command. Examples: fader('hihat', '0.58'), "
+        "pattern('perc', 'gallop'), swap('texture', 'random'), "
+        "breakdown('4'), mute('clap'). Be surgical."
+    ),
+    "tool_priority": (
+        '# pattern("perc", "gallop")  — shift the rhythm (USE FREQUENTLY)\n'
+        '# swap("hihat", "random")    — refresh a stale sound (USE FREQUENTLY)\n'
+        '# fader("hihat", "0.58")     — nudge gain ±0.03-0.08\n'
+        '# breakdown("4")             — tension moment (use sparingly)\n'
+        '# mute("texture")            — create space\n'
+        '# Example: pattern("perc", "syncopated_b") + swap("texture", "random") '
+        '+ fader("kick", "0.93")'
+    ),
+    "feedback_guide": (
+        '# "build up"  → add() new channel or unmute() existing + fader() boost\n'
+        '# "strip back" → mute() non-essential or remove() + fader() cuts\n'
+        '# "stagnant"  → pattern() + swap() combo or breakdown() for reset\n'
+        '# "too busy"  → mute() texture/perc layers + fader() reductions\n'
+        '# "needs energy" → pattern() to sixteenth_drive + fader() boosts\n'
+        "# CRITIC      → execute exact command given"
+    ),
+}
+
+
+def compute_gain_ranges(width: float) -> dict[str, tuple[float, float]]:
+    """Compute per-role gain ranges from a center + half-width."""
+    ranges = {}
+    for role, center in BASE_GAINS.items():
+        lo = max(0.0, round(center - width, 2))
+        hi = min(1.0, round(center + width, 2))
+        ranges[role] = (lo, hi)
+    return ranges
+
+
+def render_template(
+    numeric_params: dict | None = None,
+    creative_params: dict | None = None,
+) -> str:
+    """Render the DJ prompt template with the given parameters."""
+    from jinja2 import Environment, FileSystemLoader
+
+    np_ = {**DEFAULT_NUMERIC_PARAMS, **(numeric_params or {})}
+    cp = {**DEFAULT_CREATIVE_PARAMS, **(creative_params or {})}
+    gain_ranges = compute_gain_ranges(np_["gain_range_width"])
+
+    template_dir = os.path.join(os.path.dirname(__file__), "..", "prompts")
+    env = Environment(
+        loader=FileSystemLoader(template_dir),
+        keep_trailing_newline=True,
+    )
+    template = env.get_template("dj_template.j2")
+    return template.render(**np_, **cp, gain_ranges=gain_ranges)
+
+
+def trimmed_scores(
+    df: pd.DataFrame, variant: str, trim_min: bool = False
+) -> pd.DataFrame:
+    """Get scores for a variant, optionally dropping the worst run."""
+    vdf = df[df["variant"] == variant]
+    if trim_min and len(vdf) >= 4:
+        vdf = vdf.drop(vdf["objective"].idxmin())
+    return vdf
 
 
 def _build_meta_system_prompt() -> str:
@@ -368,13 +465,14 @@ def analyze_variant(
     variant: str,
     baseline: str | None = None,
     weights: dict = DEFAULT_WEIGHTS,
+    trim_min: bool = False,
 ) -> dict:
     """Compute descriptive stats and significance for one variant vs baseline.
 
     Returns a dict with mean/std/ci for each metric + objective, plus
     p-values and effect sizes if a baseline is provided.
     """
-    vdf = df[df["variant"] == variant]
+    vdf = trimmed_scores(df, variant, trim_min)
     n = len(vdf)
     result: dict = {"variant": variant, "n": n}
 
@@ -393,7 +491,7 @@ def analyze_variant(
             result[f"{col}_ci_hi"] = vals.mean()
 
     if baseline is not None:
-        bdf = df[df["variant"] == baseline]
+        bdf = trimmed_scores(df, baseline, trim_min)
         if len(bdf) >= 2 and n >= 2:
             for col in METRICS + ["objective"]:
                 v_vals = vdf[col].dropna()
@@ -414,11 +512,14 @@ def analyze_variant(
 
 
 def format_stats_table(
-    df: pd.DataFrame, baseline: str | None = None, weights: dict = DEFAULT_WEIGHTS
+    df: pd.DataFrame,
+    baseline: str | None = None,
+    weights: dict = DEFAULT_WEIGHTS,
+    trim_min: bool = False,
 ) -> str:
     """Build a rich stats table comparing all variants."""
     variants = df["variant"].unique()
-    analyses = [analyze_variant(df, v, baseline, weights) for v in variants]
+    analyses = [analyze_variant(df, v, baseline, weights, trim_min) for v in variants]
     analyses.sort(key=lambda a: a.get("objective_mean", 0), reverse=True)
 
     lines = []
@@ -447,6 +548,56 @@ def format_stats_table(
         lines.append(row)
 
     return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Log-based proxy score
+# ---------------------------------------------------------------------------
+
+# Tool-call patterns found in DJ run logs
+_LOG_TOOL_RE = re.compile(
+    r"\b(fader|pattern|swap|breakdown|mute|unmute|add|remove)\s*\("
+)
+
+
+def compute_log_proxy(log_path: str) -> dict:
+    """Extract activity metrics from a DJ run log.
+
+    Counts tool calls by type and computes a proxy score that correlates
+    with content enjoyment (CE) without requiring an AudioBox call.
+
+    Returns dict with per-action counts, actions_per_phrase, variety, proxy_score.
+    """
+    text = Path(log_path).read_text()
+    matches = _LOG_TOOL_RE.findall(text)
+    if not matches:
+        return {
+            "actions_per_phrase": 0.0,
+            "variety": 0.0,
+            "proxy_score": 0.0,
+            "total_actions": 0,
+            "action_counts": {},
+        }
+
+    from collections import Counter
+
+    counts = Counter(matches)
+    total = len(matches)
+
+    # Estimate number of phrases from play() calls
+    n_phrases = max(1, len(re.findall(r"\bplay\s*\(", text)))
+
+    actions_per_phrase = total / n_phrases
+    variety = len(counts) / total if total > 0 else 0.0
+    proxy_score = actions_per_phrase * 0.7 + variety * 0.3
+
+    return {
+        "actions_per_phrase": round(actions_per_phrase, 3),
+        "variety": round(variety, 3),
+        "proxy_score": round(proxy_score, 3),
+        "total_actions": total,
+        "action_counts": dict(counts),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -627,11 +778,444 @@ def run_generation(
 # ---------------------------------------------------------------------------
 
 
+def run_grid_search(args, config: dict):
+    """Run grid search over numeric template parameters."""
+    import itertools
+    import random
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = f"output/grid_{timestamp}"
+    os.makedirs(outdir, exist_ok=True)
+    lineage_path = os.path.join(outdir, "lineage.jsonl")
+
+    # Generate all parameter combinations
+    param_names = list(NUMERIC_PARAMS.keys())
+    param_values = [NUMERIC_PARAMS[k] for k in param_names]
+    all_combos = [
+        dict(zip(param_names, vals)) for vals in itertools.product(*param_values)
+    ]
+    print(f"Total parameter combinations: {len(all_combos)}")
+
+    if args.grid_subset and args.grid_subset < len(all_combos):
+        random.shuffle(all_combos)
+        all_combos = all_combos[: args.grid_subset]
+        print(f"Subsampled to {len(all_combos)} combinations")
+
+    config["trim_min"] = args.trim_min
+    with open(os.path.join(outdir, "config.json"), "w") as f:
+        json.dump(config, f, indent=2)
+
+    print("Generating shared palette...")
+    palette_path = generate_palette(outdir)
+
+    # Render all prompt variants
+    variant_map: dict[str, dict] = {}  # variant_name → {params, prompt_text}
+    for combo in all_combos:
+        name = "grid_sp{}_lp{}_m{}_g{}".format(
+            combo["setup_phrase_bars"],
+            combo["loop_phrase_bars"],
+            combo["min_moves"],
+            str(int(combo["gain_range_width"] * 100)).zfill(3),
+        )
+        prompt_text = render_template(numeric_params=combo)
+        variant_map[name] = {"params": combo, "prompt_text": prompt_text}
+
+    # Batch execution: ~20 prompt files per parallel_dj.sh invocation
+    batch_size = 10
+    all_variant_names = list(variant_map.keys())
+    n_replicas = config["replicas"]
+    history: list[dict] = []
+
+    for batch_start in range(0, len(all_variant_names), batch_size):
+        batch_names = all_variant_names[batch_start : batch_start + batch_size]
+        batch_num = batch_start // batch_size
+        batch_dir = os.path.join(outdir, f"batch_{batch_num}")
+        os.makedirs(batch_dir, exist_ok=True)
+
+        all_prompt_paths: list[str] = []
+        replica_info: list[dict] = []  # track (variant, replica, path)
+
+        for vname in batch_names:
+            vi = variant_map[vname]
+            for r in range(n_replicas):
+                replica_name = f"{vname}_rep{r}"
+                prompt_path = os.path.join(batch_dir, f"{replica_name}.txt")
+                with open(prompt_path, "w") as f:
+                    f.write(vi["prompt_text"])
+                all_prompt_paths.append(prompt_path)
+                replica_info.append(
+                    {"variant": vname, "replica": r, "path": prompt_path}
+                )
+
+        print(
+            f"\n--- Batch {batch_num} ({len(batch_names)} combos, "
+            f"{len(all_prompt_paths)} runs) ---"
+        )
+        ok = run_parallel_dj(all_prompt_paths, batch_dir, palette_path, config)
+        if not ok:
+            print(f"  WARNING: batch {batch_num} exited with non-zero status")
+
+        score_entries = parse_scores(batch_dir)
+        label_to_scores: dict[str, dict] = {}
+        for entry in score_entries:
+            label_to_scores[entry["prompt"]] = entry["scores"]
+
+        for ri in replica_info:
+            label = Path(ri["path"]).stem
+            scores = label_to_scores.get(label)
+            if scores is None:
+                print(f"  No score for {label}")
+                continue
+            obj = compute_objective(scores, config["weights"])
+            row = {
+                "variant": ri["variant"],
+                "gen": 0,
+                "parent": None,
+                "knob": "grid",
+                "replica": ri["replica"],
+                "scores": scores,
+                "objective": obj,
+                "params": variant_map[ri["variant"]]["params"],
+            }
+            append_lineage(lineage_path, row)
+            history.append(
+                {**row, "prompt_text": variant_map[ri["variant"]]["prompt_text"]}
+            )
+
+    # Build results
+    history_df = scores_to_dataframe(history)
+    # Add params columns from history
+    for key in NUMERIC_PARAMS:
+        history_df[key] = [h.get("params", {}).get(key) for h in history]
+
+    # Leaderboard sorted by (optionally trimmed) mean objective
+    print(f"\n{'=' * 60}")
+    print("=== GRID SEARCH COMPLETE ===")
+    print(f"{'=' * 60}")
+
+    variant_stats = []
+    for vname in history_df["variant"].unique():
+        vdf = trimmed_scores(history_df, vname, args.trim_min)
+        if vdf.empty:
+            continue
+        variant_stats.append(
+            {
+                "variant": vname,
+                "n": len(vdf),
+                "obj_mean": vdf["objective"].mean(),
+                "obj_std": vdf["objective"].std(),
+                **{m: vdf[m].mean() for m in METRICS},
+                **variant_map[vname]["params"],
+            }
+        )
+    variant_stats.sort(key=lambda x: x["obj_mean"], reverse=True)
+
+    header = (
+        f"{'Rank':<5} {'Variant':<30} {'n':>3} "
+        f"{'Obj':>7} {'±':>5} "
+        f"{'CE':>6} {'CU':>6} {'PC':>6} {'PQ':>6} "
+        f"{'sp':>3} {'lp':>3} {'mv':>3} {'gw':>5}"
+    )
+    print(f"\n{header}")
+    print("-" * len(header))
+    for i, s in enumerate(variant_stats):
+        print(
+            f"{i + 1:<5} {s['variant']:<30} {s['n']:>3} "
+            f"{s['obj_mean']:>7.3f} {s['obj_std']:>5.3f} "
+            f"{s['CE']:>6.2f} {s['CU']:>6.2f} {s['PC']:>6.2f} {s['PQ']:>6.2f} "
+            f"{s['setup_phrase_bars']:>3} {s['loop_phrase_bars']:>3} "
+            f"{s['min_moves']:>3} {s['gain_range_width']:>5.2f}"
+        )
+
+    # Save results
+    leaderboard_lines = [header, "-" * len(header)]
+    for i, s in enumerate(variant_stats):
+        leaderboard_lines.append(
+            f"{i + 1:<5} {s['variant']:<30} {s['n']:>3} "
+            f"{s['obj_mean']:>7.3f} {s['obj_std']:>5.3f} "
+            f"{s['CE']:>6.2f} {s['CU']:>6.2f} {s['PC']:>6.2f} {s['PQ']:>6.2f} "
+            f"{s['setup_phrase_bars']:>3} {s['loop_phrase_bars']:>3} "
+            f"{s['min_moves']:>3} {s['gain_range_width']:>5.2f}"
+        )
+    Path(os.path.join(outdir, "leaderboard.txt")).write_text(
+        "\n".join(leaderboard_lines) + "\n"
+    )
+
+    history_df.to_csv(os.path.join(outdir, "results.csv"), index=False)
+
+    if variant_stats:
+        best = variant_stats[0]
+        print(f"\nBest: {best['variant']} (obj={best['obj_mean']:.3f})")
+        best_entries = [
+            h for h in history if h["variant"] == best["variant"] and "prompt_text" in h
+        ]
+        if best_entries:
+            best_path = os.path.join(outdir, "best_prompt.txt")
+            Path(best_path).write_text(best_entries[0]["prompt_text"])
+            print(f"Best prompt saved to: {best_path}")
+
+    print(f"\nOutput directory: {outdir}")
+
+
+def run_narrow_grid(args, config: dict):
+    """Two-stage narrowed grid search over the best parameter subspace.
+
+    Stage 1: 6 combos (lp=[4,8] x g=[0.05,0.10,0.15]) x replicas
+    Stage 2: top-2 combos x 3 additional replicas for validation
+    """
+    import itertools
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    outdir = f"output/narrow_{timestamp}"
+    os.makedirs(outdir, exist_ok=True)
+    lineage_path = os.path.join(outdir, "lineage.jsonl")
+
+    # Fixed params from prior grid search findings
+    fixed = {"setup_phrase_bars": 4, "min_moves": 2}
+    narrow_grid = {
+        "loop_phrase_bars": [4, 8],
+        "gain_range_width": [0.05, 0.10, 0.15],
+    }
+    n_replicas = config["replicas"]
+
+    param_names = list(narrow_grid.keys())
+    param_values = [narrow_grid[k] for k in param_names]
+    all_combos = [
+        {**fixed, **dict(zip(param_names, vals))}
+        for vals in itertools.product(*param_values)
+    ]
+    print(
+        f"Narrow grid: {len(all_combos)} combos × {n_replicas} replicas = "
+        f"{len(all_combos) * n_replicas} runs (stage 1)"
+    )
+
+    config["trim_min"] = args.trim_min
+    with open(os.path.join(outdir, "config.json"), "w") as f:
+        json.dump(
+            {**config, "fixed_params": fixed, "narrow_grid": narrow_grid}, f, indent=2
+        )
+
+    print("Generating shared palette...")
+    palette_path = generate_palette(outdir)
+
+    # Render all prompt variants
+    variant_map: dict[str, dict] = {}
+    for combo in all_combos:
+        name = "narrow_lp{}_g{}".format(
+            combo["loop_phrase_bars"],
+            str(int(combo["gain_range_width"] * 100)).zfill(3),
+        )
+        prompt_text = render_template(numeric_params=combo)
+        variant_map[name] = {"params": combo, "prompt_text": prompt_text}
+
+    history: list[dict] = []
+
+    def _run_batch(variant_names: list[str], stage_label: str, replicas: int):
+        """Run a batch of variants and collect scores."""
+        batch_dir = os.path.join(outdir, stage_label)
+        os.makedirs(batch_dir, exist_ok=True)
+
+        all_prompt_paths: list[str] = []
+        replica_info: list[dict] = []
+
+        for vname in variant_names:
+            vi = variant_map[vname]
+            for r in range(replicas):
+                replica_name = f"{vname}_rep{r}"
+                prompt_path = os.path.join(batch_dir, f"{replica_name}.txt")
+                with open(prompt_path, "w") as f:
+                    f.write(vi["prompt_text"])
+                all_prompt_paths.append(prompt_path)
+                replica_info.append(
+                    {"variant": vname, "replica": r, "path": prompt_path}
+                )
+
+        print(
+            f"\n--- {stage_label} ({len(variant_names)} combos, "
+            f"{len(all_prompt_paths)} runs) ---"
+        )
+        ok = run_parallel_dj(all_prompt_paths, batch_dir, palette_path, config)
+        if not ok:
+            print(f"  WARNING: {stage_label} exited with non-zero status")
+
+        score_entries = parse_scores(batch_dir)
+        label_to_scores: dict[str, dict] = {}
+        for entry in score_entries:
+            label_to_scores[entry["prompt"]] = entry["scores"]
+
+        # Collect log proxy scores from DJ run logs
+        for ri in replica_info:
+            label = Path(ri["path"]).stem
+            log_path = os.path.join(batch_dir, label, "dj.log")
+            proxy = compute_log_proxy(log_path) if os.path.exists(log_path) else {}
+
+            scores = label_to_scores.get(label)
+            if scores is None:
+                print(f"  No score for {label}")
+                continue
+            obj = compute_objective(scores, config["weights"])
+            row = {
+                "variant": ri["variant"],
+                "gen": 0,
+                "parent": None,
+                "knob": "narrow_grid",
+                "replica": ri["replica"],
+                "scores": scores,
+                "objective": obj,
+                "params": variant_map[ri["variant"]]["params"],
+            }
+            if proxy:
+                row["log_proxy"] = proxy
+            append_lineage(lineage_path, row)
+            history.append(
+                {**row, "prompt_text": variant_map[ri["variant"]]["prompt_text"]}
+            )
+
+    # ---- Stage 1: all combos ----
+    all_variant_names = list(variant_map.keys())
+    _run_batch(all_variant_names, "stage_1", n_replicas)
+
+    # Build stage 1 results
+    history_df = scores_to_dataframe(history)
+    for key in list(fixed.keys()) + list(narrow_grid.keys()):
+        history_df[key] = [h.get("params", {}).get(key) for h in history]
+
+    # Rank by mean objective
+    variant_means: dict[str, float] = {}
+    for vname in history_df["variant"].unique():
+        vdf = trimmed_scores(history_df, vname, args.trim_min)
+        if not vdf.empty:
+            variant_means[vname] = vdf["objective"].mean()
+
+    ranking = sorted(variant_means, key=variant_means.get, reverse=True)
+
+    print(f"\n{'=' * 60}")
+    print("=== STAGE 1 LEADERBOARD ===")
+    print(f"{'=' * 60}")
+    _print_narrow_leaderboard(
+        history_df, variant_map, variant_means, ranking, args.trim_min
+    )
+
+    # ---- Stage 2: top-2 combos, 3 additional replicas ----
+    top2 = ranking[:2]
+    stage2_replicas = 3
+    print(
+        f"\nStage 2: validating top-2 with {stage2_replicas} additional replicas each"
+    )
+    print(f"  Top-2: {top2}")
+
+    _run_batch(top2, "stage_2", stage2_replicas)
+
+    # Rebuild full results
+    history_df = scores_to_dataframe(history)
+    for key in list(fixed.keys()) + list(narrow_grid.keys()):
+        history_df[key] = [h.get("params", {}).get(key) for h in history]
+
+    variant_means = {}
+    for vname in history_df["variant"].unique():
+        vdf = trimmed_scores(history_df, vname, args.trim_min)
+        if not vdf.empty:
+            variant_means[vname] = vdf["objective"].mean()
+
+    ranking = sorted(variant_means, key=variant_means.get, reverse=True)
+
+    print(f"\n{'=' * 60}")
+    print("=== FINAL LEADERBOARD (stage 1 + stage 2) ===")
+    print(f"{'=' * 60}")
+    _print_narrow_leaderboard(
+        history_df, variant_map, variant_means, ranking, args.trim_min
+    )
+
+    # Significance test: top-1 vs top-2
+    if len(ranking) >= 2:
+        a = analyze_variant(
+            history_df, ranking[0], baseline=ranking[1], trim_min=args.trim_min
+        )
+        if "objective_p" in a:
+            p = a["objective_p"]
+            d = a["objective_d"]
+            sig = (
+                "p<0.001"
+                if p < 0.001
+                else "p<0.01"
+                if p < 0.01
+                else "p<0.05"
+                if p < 0.05
+                else f"p={p:.3f}"
+            )
+            print(f"\n  #1 vs #2: {sig}, d={d:+.2f}")
+        else:
+            print("\n  Insufficient replicas for significance test")
+
+    # Save artifacts
+    history_df.to_csv(os.path.join(outdir, "results.csv"), index=False)
+
+    if ranking:
+        best = ranking[0]
+        best_entries = [
+            h for h in history if h["variant"] == best and "prompt_text" in h
+        ]
+        if best_entries:
+            best_path = os.path.join(outdir, "best_prompt.txt")
+            Path(best_path).write_text(best_entries[0]["prompt_text"])
+            print(f"\nBest prompt saved to: {best_path}")
+
+    print(f"Output directory: {outdir}")
+
+
+def _print_narrow_leaderboard(
+    history_df: pd.DataFrame,
+    variant_map: dict,
+    variant_means: dict,
+    ranking: list[str],
+    trim_min: bool,
+):
+    """Print a compact leaderboard for narrow grid results."""
+    header = (
+        f"{'Rank':<5} {'Variant':<20} {'n':>3} "
+        f"{'Obj':>7} {'±':>5} "
+        f"{'CE':>6} {'CU':>6} {'PC':>6} {'PQ':>6} "
+        f"{'lp':>3} {'gw':>5}"
+    )
+    print(f"\n{header}")
+    print("-" * len(header))
+    for i, vname in enumerate(ranking):
+        vdf = trimmed_scores(history_df, vname, trim_min)
+        if vdf.empty:
+            continue
+        params = variant_map[vname]["params"]
+        print(
+            f"{i + 1:<5} {vname:<20} {len(vdf):>3} "
+            f"{variant_means[vname]:>7.3f} {vdf['objective'].std():>5.3f} "
+            f"{vdf['CE'].mean():>6.2f} {vdf['CU'].mean():>6.2f} "
+            f"{vdf['PC'].mean():>6.2f} {vdf['PQ'].mean():>6.2f} "
+            f"{params['loop_phrase_bars']:>3} {params['gain_range_width']:>5.2f}"
+        )
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Automated DJ prompt optimization with statistical analysis."
     )
-    parser.add_argument("--seed", required=True, help="Path to seed prompt .txt file")
+
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--seed", help="Path to seed prompt .txt file")
+    source.add_argument(
+        "--template",
+        action="store_true",
+        help="Use Jinja2 template with default params as seed",
+    )
+    source.add_argument(
+        "--grid",
+        action="store_true",
+        help="Grid search over numeric template parameters (no meta-LLM)",
+    )
+    source.add_argument(
+        "--grid-narrow",
+        action="store_true",
+        help="Two-stage narrowed grid (sp=4, m=2, lp=[4,8], g=[0.05,0.10,0.15])",
+    )
+
     parser.add_argument(
         "--generations", type=int, default=4, help="Number of generations (default: 4)"
     )
@@ -645,7 +1229,7 @@ def main():
         help="Replicas per variant for statistical power (default: 3)",
     )
     parser.add_argument(
-        "--bars", type=int, default=64, help="Bars per DJ run (default: 64)"
+        "--bars", type=int, default=128, help="Bars per DJ run (default: 128)"
     )
     parser.add_argument("--bpm", type=int, default=128, help="BPM (default: 128)")
     parser.add_argument(
@@ -657,6 +1241,18 @@ def main():
     )
     parser.add_argument(
         "--resume", default=None, help="Resume from existing output directory"
+    )
+    parser.add_argument(
+        "--trim-min",
+        action="store_true",
+        default=False,
+        help="Drop lowest-scoring replica per variant (requires n>=4)",
+    )
+    parser.add_argument(
+        "--grid-subset",
+        type=int,
+        default=None,
+        help="Subsample N random combinations for grid search",
     )
     args = parser.parse_args()
 
@@ -670,7 +1266,17 @@ def main():
         "variants": args.variants,
         "replicas": args.replicas,
         "weights": DEFAULT_WEIGHTS,
+        "trim_min": args.trim_min,
     }
+
+    # Grid search modes — separate flow, then exit
+    if args.grid:
+        run_grid_search(args, config)
+        return
+
+    if args.grid_narrow:
+        run_narrow_grid(args, config)
+        return
 
     if args.resume:
         # ---- Resume from existing run ----
@@ -706,7 +1312,9 @@ def main():
             if 0 in history_df["gen"].values
             else None
         )
-        print(f"\n{format_stats_table(history_df, baseline=baseline)}\n")
+        print(
+            f"\n{format_stats_table(history_df, baseline=baseline, trim_min=args.trim_min)}\n"
+        )
 
     else:
         # ---- Fresh run ----
@@ -727,7 +1335,11 @@ def main():
         print(f"=== Generation 0: Score Seed ({args.replicas} replicas) ===")
         print(f"{'=' * 60}")
 
-        seed_text = Path(args.seed).read_text()
+        if args.template:
+            seed_text = render_template()
+            print("Using template-rendered seed prompt")
+        else:
+            seed_text = Path(args.seed).read_text()
         seed_variant = "variant_0_seed"
         gen0_dir = os.path.join(outdir, "gen_0")
         os.makedirs(gen0_dir, exist_ok=True)
@@ -798,14 +1410,16 @@ def main():
         print(f"=== Generation {gen}/{args.generations} ===")
         print(f"{'=' * 60}")
 
-        # Select top-2 parents by mean objective (must have prompt text)
-        parent_stats = (
-            history_df.groupby("variant")["objective"]
-            .mean()
-            .sort_values(ascending=False)
-        )
+        # Select top-2 parents by (optionally trimmed) mean objective
+        parent_means = {}
+        for vname in history_df["variant"].unique():
+            vdf = trimmed_scores(history_df, vname, args.trim_min)
+            if not vdf.empty:
+                parent_means[vname] = vdf["objective"].mean()
+        parent_ranking = sorted(parent_means, key=parent_means.get, reverse=True)
+
         parents = []
-        for variant_name in parent_stats.index:
+        for variant_name in parent_ranking:
             entries_with_text = [
                 h
                 for h in history
@@ -813,17 +1427,13 @@ def main():
             ]
             if entries_with_text:
                 rep = entries_with_text[0]
+                vdf = trimmed_scores(history_df, variant_name, args.trim_min)
                 parents.append(
                     {
                         "variant": variant_name,
                         "prompt_text": rep["prompt_text"],
-                        "scores": {
-                            m: history_df[history_df["variant"] == variant_name][
-                                m
-                            ].mean()
-                            for m in METRICS
-                        },
-                        "objective": parent_stats[variant_name],
+                        "scores": {m: vdf[m].mean() for m in METRICS},
+                        "objective": parent_means[variant_name],
                     }
                 )
             if len(parents) >= 2:
@@ -846,14 +1456,18 @@ def main():
             config=config,
         )
 
-        print(f"\n{format_stats_table(history_df, baseline=baseline_variant)}\n")
+        print(
+            f"\n{format_stats_table(history_df, baseline=baseline_variant, trim_min=args.trim_min)}\n"
+        )
 
     # ---- Final summary ----
     print(f"\n{'=' * 60}")
     print("=== OPTIMIZATION COMPLETE ===")
     print(f"{'=' * 60}")
 
-    final_table = format_stats_table(history_df, baseline=baseline_variant)
+    final_table = format_stats_table(
+        history_df, baseline=baseline_variant, trim_min=args.trim_min
+    )
     print(f"\n{final_table}\n")
 
     # Save leaderboard
@@ -865,14 +1479,14 @@ def main():
     history_df.to_csv(csv_path, index=False)
     print(f"Full results: {csv_path}")
 
-    # Save best prompt
-    best_variant = (
-        history_df.groupby("variant")["objective"]
-        .mean()
-        .sort_values(ascending=False)
-        .index[0]
-    )
-    best_obj = history_df[history_df["variant"] == best_variant]["objective"].mean()
+    # Save best prompt (using optionally trimmed means)
+    best_means = {}
+    for vname in history_df["variant"].unique():
+        vdf = trimmed_scores(history_df, vname, args.trim_min)
+        if not vdf.empty:
+            best_means[vname] = vdf["objective"].mean()
+    best_variant = max(best_means, key=best_means.get)
+    best_obj = best_means[best_variant]
     print(f"Best: {best_variant} (obj={best_obj:.3f})")
 
     best_entries = [
@@ -889,7 +1503,9 @@ def main():
         for variant in history_df["variant"].unique():
             if variant == baseline_variant:
                 continue
-            a = analyze_variant(history_df, variant, baseline=baseline_variant)
+            a = analyze_variant(
+                history_df, variant, baseline=baseline_variant, trim_min=args.trim_min
+            )
             if "objective_p" in a:
                 p = a["objective_p"]
                 d = a["objective_d"]

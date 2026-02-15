@@ -103,9 +103,47 @@ def play(file):
     default=None,
     help="JSON file with pre-selected palette (role→path map). Skips palette selection.",
 )
-def dj(sample_dir, bpm, lm, verbose, output, bars, critic_lm, palette):
+@click.option(
+    "--palette-dir",
+    default=None,
+    help="Directory of curated palette JSONs. Picks one at random (ignored if --palette is set).",
+)
+@click.option(
+    "--prompt",
+    default=None,
+    help="Text file with custom DJ instructions (overrides built-in prompt).",
+)
+@click.option(
+    "--no-cache",
+    is_flag=True,
+    help="Disable DSPy LLM response cache (forces fresh completions).",
+)
+def dj(
+    sample_dir,
+    bpm,
+    lm,
+    verbose,
+    output,
+    bars,
+    critic_lm,
+    palette,
+    palette_dir,
+    prompt,
+    no_cache,
+):
     """Start a streaming DJ set powered by DSPy RLM."""
+    import random
+    from pathlib import Path
+
     from bergain.dj import run_dj
+
+    palette_file = palette
+    if palette_file is None and palette_dir is not None:
+        candidates = list(Path(palette_dir).glob("*.json"))
+        if not candidates:
+            raise click.ClickException(f"No .json files found in {palette_dir}")
+        palette_file = str(random.choice(candidates))
+        click.echo(f"Selected palette: {palette_file}")
 
     run_dj(
         sample_dir=sample_dir,
@@ -115,5 +153,7 @@ def dj(sample_dir, bpm, lm, verbose, output, bars, critic_lm, palette):
         output=output,
         max_bars=bars,
         critic_lm=critic_lm,
-        palette_file=palette,
+        palette_file=palette_file,
+        prompt_file=prompt,
+        no_cache=no_cache,
     )

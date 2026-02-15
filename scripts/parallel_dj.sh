@@ -2,13 +2,14 @@
 # parallel_dj.sh — Run bergain DJ across models and/or prompts in parallel
 #
 # Usage:
-#   ./scripts/parallel_dj.sh [--bars N] [--bpm N] [--prompt FILE]... [--outdir DIR] [--palette FILE]
+#   ./scripts/parallel_dj.sh [--bars N] [--bpm N] [--prompt FILE]... [--outdir DIR] [--palette FILE] [--palette-dir DIR]
 #
 # Multiple --prompt flags run each prompt variant in parallel.
 # If no --prompt is given, uses the built-in prompt.
 #
-# --outdir DIR      Use DIR instead of auto-generated output/parallel_YYYYMMDD_HHMMSS/
-# --palette FILE    Skip palette generation, use this palette.json
+# --outdir DIR        Use DIR instead of auto-generated output/parallel_YYYYMMDD_HHMMSS/
+# --palette FILE      Skip palette generation, use this palette.json
+# --palette-dir DIR   Pick a random curated palette from DIR (ignored if --palette is set)
 #
 # Requires: OPENROUTER_API_KEY in env or .env file
 set -euo pipefail
@@ -25,15 +26,19 @@ CRITIC_LM="openrouter/openai/gpt-5-nano"
 PROMPT_FILES=()
 CUSTOM_OUTDIR=""
 CUSTOM_PALETTE=""
+PALETTE_DIR=""
+NO_CACHE=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --bars)      BARS="$2";            shift 2 ;;
-        --bpm)       BPM="$2";             shift 2 ;;
-        --critic-lm) CRITIC_LM="$2";       shift 2 ;;
-        --prompt)    PROMPT_FILES+=("$2");  shift 2 ;;
-        --outdir)    CUSTOM_OUTDIR="$2";    shift 2 ;;
-        --palette)   CUSTOM_PALETTE="$2";   shift 2 ;;
-        *)           shift ;;
+        --bars)        BARS="$2";            shift 2 ;;
+        --bpm)         BPM="$2";             shift 2 ;;
+        --critic-lm)   CRITIC_LM="$2";       shift 2 ;;
+        --prompt)      PROMPT_FILES+=("$2");  shift 2 ;;
+        --outdir)      CUSTOM_OUTDIR="$2";    shift 2 ;;
+        --palette)     CUSTOM_PALETTE="$2";   shift 2 ;;
+        --palette-dir) PALETTE_DIR="$2";      shift 2 ;;
+        --no-cache)    NO_CACHE="--no-cache"; shift ;;
+        *)             shift ;;
     esac
 done
 
@@ -58,6 +63,16 @@ if [[ -n "$CUSTOM_PALETTE" ]]; then
     PALETTE="$OUTDIR/palette.json"
     cp "$CUSTOM_PALETTE" "$PALETTE"
     echo "Using provided palette: $CUSTOM_PALETTE"
+elif [[ -n "$PALETTE_DIR" ]]; then
+    # Pick a random curated palette from the directory
+    PICKED=$(python3 -c "import random,glob; f=glob.glob('$PALETTE_DIR/*.json'); print(random.choice(f)) if f else exit(1)" 2>/dev/null)
+    if [[ -z "$PICKED" ]]; then
+        echo "ERROR: No .json files found in $PALETTE_DIR" >&2
+        exit 1
+    fi
+    PALETTE="$OUTDIR/palette.json"
+    cp "$PICKED" "$PALETTE"
+    echo "Using curated palette: $PICKED"
 else
     PALETTE="$OUTDIR/palette.json"
     uv run python -c "
@@ -114,6 +129,7 @@ for model in "${MODELS[@]}"; do
             --bpm "$BPM" \
             -o "$outfile" \
             $PROMPT_ARG \
+            $NO_CACHE \
             > "$logfile" 2>&1 &
 
         PIDS+=($!)

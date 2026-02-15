@@ -90,11 +90,11 @@ NAMED_PATTERNS = {
 # Structural arc phases: (threshold, layer_cap, phase_name)
 # Thresholds are fractions of total bars; first matching threshold wins.
 _ARC_PHASES = [
-    (0.125, 2, "intro phase"),
-    (0.25, 4, "building phase"),
-    (0.75, 6, "full groove phase"),
-    (0.875, 4, "stripping phase"),
-    (1.1, 2, "outro phase"),
+    (0.125, 3, "intro phase"),
+    (0.375, 6, "building phase"),
+    (0.8125, 6, "full groove phase"),  # 4 more bars of peak (was 0.75)
+    (0.9063, 4, "stripping phase"),  # shorter strip (was 0.875)
+    (1.1, 2, "outro phase"),  # shorter outro
 ]
 _DEFAULT_CAP = 6  # infinite mode: flat cap
 
@@ -439,7 +439,8 @@ compelling techno set — not to write careful software.
 #
 # PACING RULES:
 #   - 1-2 changes per phrase during BUILD. Fader nudges don't count.
-#   - During PEAK: hold the groove. Maybe one fader nudge per phrase.
+#   - During PEAK: play("16") between actions — let the groove HYPNOTIZE.
+#     One fader nudge or pattern change per 16-bar block. No more.
 #   - After a breakdown, bring layers back across 2-3 phrases (not all at once)
 #
 # ENERGY ARC SHAPES (pick one and commit):
@@ -504,9 +505,16 @@ compelling techno set — not to write careful software.
 #   active layers by bar 48. Add bassline, perc, texture, clap — keep building.
 #   The set needs density before breakdowns have any impact.
 # PEAK (bars 64-96): 4-6 layers running. HOLD the groove — don't strip yet.
-#   This is the payoff. Maybe swap a sample or nudge a fader, but keep it full.
+#   Keep layers active, but the peak must EVOLVE, not freeze:
+#   - Every 16 bars, change ONE pattern on a non-kick layer. This keeps the
+#     groove moving without losing its foundation. Good peak transitions:
+#     perc: syncopated_a → gallop (adds urgency)
+#     hihat: offbeat_8ths → sixteenth_drive (intensifies)
+#     bassline: syncopated_a → sixteenth_drive (drives harder)
+#   - Ride faders alongside pattern changes for smooth transitions.
+#   - The peak should feel like a JOURNEY, not a static wall of sound.
 # BREAKDOWN (bar ~80): NOW strip to kick for 4-8 bars. The impact comes from
-#   the contrast with the dense peak. Bring layers back over 2-3 phrases.
+#   the contrast with the dense, evolving peak. Bring layers back over 2-3 phrases.
 # STRIP (bars 96-112): Remove layers one at a time toward the outro.
 # OUTRO (bars 112+): Fade to kick alone. Let the room breathe out.
 #
@@ -574,11 +582,16 @@ def run_dj(
     critic_lm: str | None = None,
     palette_file: str | None = None,
     prompt_file: str | None = None,
+    no_cache: bool = False,
 ) -> None:
     """Build tools, configure DSPy, invoke RLM, handle shutdown."""
     load_dotenv()
-    main_lm = dspy.LM(lm)
-    cheap_lm = dspy.LM(critic_lm) if critic_lm else main_lm
+    lm_kwargs: dict = {}
+    if no_cache:
+        lm_kwargs["cache"] = False
+        lm_kwargs["temperature"] = 1.0
+    main_lm = dspy.LM(lm, **lm_kwargs)
+    cheap_lm = dspy.LM(critic_lm, **lm_kwargs) if critic_lm else main_lm
     dspy.configure(lm=main_lm)
 
     print(f"Indexing samples from {sample_dir}...")
@@ -614,6 +627,14 @@ def run_dj(
     bars_played = [0]
     bar_history: list[dict] = []
     mixer_state: dict[str, dict] = {}
+    set_complete = [False]
+
+    _COMPLETE_MSG = json.dumps(
+        {
+            "set_complete": True,
+            "error": "SET COMPLETE — bar limit reached. Call SUBMIT('done') NOW.",
+        }
+    )
 
     interpreter = ResilientInterpreter()
     cleanup_done = [False]
@@ -718,10 +739,13 @@ def run_dj(
         phase, energy, target_energy, corrections, feedback, mixer,
         buffer_depth.  When the set reaches max_bars, the status includes
         set_complete=true — call SUBMIT('done') immediately."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         n = int(bars)
         all_corrections = _render_bars(n)
         status_str = _build_status(all_corrections, n)
         if max_bars and bars_played[0] >= max_bars:
+            set_complete[0] = True
             status = json.loads(status_str)
             status["set_complete"] = True
             status["feedback"] = (
@@ -734,6 +758,8 @@ def run_dj(
     def breakdown(bars: str = "4") -> str:
         """Mute all channels except kick for N bars, then auto-restore.
         Returns JSON status."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         n = int(bars)
         # Save current mute states
         saved = {role: ch.get("muted", False) for role, ch in mixer_state.items()}
@@ -754,7 +780,18 @@ def run_dj(
         role: str, gain: str, pattern: str = "four_on_floor", type: str = "oneshot"
     ) -> str:
         """Add a channel to the mixer. Returns JSON with mixer snapshot."""
-        resolved = _resolve_pattern(pattern) if type == "oneshot" else []
+        if set_complete[0]:
+            return _COMPLETE_MSG
+        # Auto-detect: if this role's palette sample is a loop, render as loop
+        sample_entry = next(
+            (s for s in role_map.get(role, []) if s["path"] == palette.get(role)),
+            None,
+        )
+        if sample_entry and sample_entry.get("loop", False):
+            type = "loop"
+        else:
+            type = "oneshot"
+        resolved = _resolve_pattern(pattern)
         mixer_state[role] = {
             "type": type,
             "gain": float(gain),
@@ -787,6 +824,8 @@ def run_dj(
 
     def remove(role: str) -> str:
         """Remove a channel from the mixer. Returns JSON with mixer snapshot."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         removed = mixer_state.pop(role, None)
         if removed is None:
             return json.dumps({"error": f"No channel '{role}' on mixer"})
@@ -795,6 +834,8 @@ def run_dj(
 
     def fader(role: str, gain: str) -> str:
         """Adjust a channel's volume. Returns JSON with mixer snapshot."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         if role not in mixer_state:
             return json.dumps({"error": f"No channel '{role}' on mixer"})
         g = float(gain)
@@ -811,6 +852,8 @@ def run_dj(
     def pattern(role: str, name_or_array: str) -> str:
         """Change a channel's beat pattern. Accepts named patterns or JSON
         arrays. Returns JSON with mixer snapshot."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         if role not in mixer_state:
             return json.dumps({"error": f"No channel '{role}' on mixer"})
         try:
@@ -823,6 +866,8 @@ def run_dj(
 
     def mute(role: str) -> str:
         """Mute a channel (preserves all settings). Returns JSON with mixer snapshot."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         if role not in mixer_state:
             return json.dumps({"error": f"No channel '{role}' on mixer"})
         mixer_state[role]["muted"] = True
@@ -831,6 +876,8 @@ def run_dj(
 
     def unmute(role: str) -> str:
         """Unmute a channel. Returns JSON with mixer snapshot."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         if role not in mixer_state:
             return json.dumps({"error": f"No channel '{role}' on mixer"})
         mixer_state[role]["muted"] = False
@@ -843,6 +890,8 @@ def run_dj(
         - swap("hihat", "3") → swap to index 3
         - swap("hihat", "random") → swap randomly
         Returns: JSON string."""
+        if set_complete[0]:
+            return _COMPLETE_MSG
         alternatives = role_map.get(role, [])
         if not alternatives:
             return json.dumps({"error": f"No alternatives for {role}"})

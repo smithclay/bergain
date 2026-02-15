@@ -141,6 +141,7 @@ class FileWriter:
         change = -1.0 - combined.max_dBFS
         combined = combined.apply_gain(change)
         Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+        combined = combined.set_sample_width(4)  # force 32-bit for consistent scoring
         combined.export(self.output_path, format="wav")
         total_s = len(combined) / 1000
         print(f"Wrote {total_s:.1f}s ({total_s / 60:.1f} min) -> {self.output_path}")

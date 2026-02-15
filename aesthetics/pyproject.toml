@@ -2,4 +2,8 @@
 name = "bergain-aesthetics"
 version = "0.1.0"
 requires-python = ">=3.11"
-dependencies = ["modal"]
+dependencies = [
+    "fastapi>=0.129.0",
+    "modal",
+    "python-multipart>=0.0.22",
+]
