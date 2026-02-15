@@ -265,6 +265,184 @@ def make_bass(bars=4):
 
 
 # ---------------------------------------------------------------------------
+# Musical constants
+# ---------------------------------------------------------------------------
+
+# Chord progression: Cm - Fm - Ab - Bb (i - iv - VI - VII)
+BASS_ROOTS = [36, 41, 44, 46]  # C2, F2, Ab2, Bb2
+
+CHORDS = [
+    (60, 63, 67),  # Cm: C4, Eb4, G4
+    (53, 56, 60),  # Fm: F3, Ab3, C4
+    (56, 60, 63),  # Ab: Ab3, C4, Eb4
+    (58, 62, 65),  # Bb: Bb3, D4, F4
+]
+
+
+# ---------------------------------------------------------------------------
+# Drum pattern variants
+# ---------------------------------------------------------------------------
+
+
+def make_intro_drums(bars=4):
+    """Light hi-hats only."""
+    notes = []
+    for eighth in range(bars * 8):
+        beat = eighth * 0.5
+        vel = 65 if eighth % 2 == 1 else 35
+        notes.extend([42, beat, 0.25, vel, 0])
+    return notes
+
+
+def make_build_drums(bars=4):
+    """Kick + hi-hats + soft claps."""
+    notes = make_kick(bars) + make_hihat(bars)
+    for bar in range(bars):
+        for beat_in_bar in [1, 3]:
+            beat = bar * 4 + beat_in_bar
+            notes.extend([38, float(beat), 0.5, 55, 0])
+    return notes
+
+
+def make_breakdown_drums(bars=4):
+    """Sparse: kick on 1, ride cymbal on quarters."""
+    notes = []
+    for bar in range(bars):
+        notes.extend([36, float(bar * 4), 0.75, 75, 0])
+        for beat in range(4):
+            notes.extend([51, float(bar * 4 + beat), 0.5, 45, 0])
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# Bass pattern variants
+# ---------------------------------------------------------------------------
+
+
+def make_build_bass(bars=4):
+    """Simple sustained roots, one per bar."""
+    notes = []
+    for bar in range(bars):
+        root = BASS_ROOTS[bar % len(BASS_ROOTS)]
+        notes.extend([root, float(bar * 4), 3.0, 90, 0])
+    return notes
+
+
+def make_drop_bass(bars=4):
+    """Syncopated bass following chord roots."""
+    offsets = [
+        (0.0, 0.75, 100),
+        (1.0, 0.25, 80),
+        (1.5, 0.5, 90),
+        (2.5, 0.5, 85),
+        (3.0, 0.25, 75),
+        (3.5, 0.5, 95),
+    ]
+    notes = []
+    for bar in range(bars):
+        root = BASS_ROOTS[bar % len(BASS_ROOTS)]
+        base = bar * 4
+        for start, dur, vel in offsets:
+            notes.extend([root, start + base, dur, vel, 0])
+    return notes
+
+
+def make_breakdown_bass(bars=4):
+    """Walking bass through chord tones."""
+    walks = [
+        [36, 39, 43, 48],  # Cm: C2, Eb2, G2, C3
+        [41, 44, 48, 53],  # Fm: F2, Ab2, C3, F3
+        [44, 48, 51, 56],  # Ab: Ab2, C3, Eb3, Ab3
+        [46, 50, 53, 58],  # Bb: Bb2, D3, F3, Bb3
+    ]
+    notes = []
+    for bar in range(bars):
+        walk = walks[bar % len(walks)]
+        for i, pitch in enumerate(walk):
+            notes.extend([pitch, float(bar * 4 + i), 0.9, 80, 0])
+    return notes
+
+
+def make_finale_bass(bars=4):
+    """Driving bass with octave jumps on offbeats."""
+    notes = []
+    for bar in range(bars):
+        root = BASS_ROOTS[bar % len(BASS_ROOTS)]
+        for beat in range(4):
+            t = float(bar * 4 + beat)
+            notes.extend([root, t, 0.4, 100, 0])
+            notes.extend([root + 12, t + 0.5, 0.35, 80, 0])
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# Chord / Pad patterns
+# ---------------------------------------------------------------------------
+
+
+def make_pad_sustained(bars=4):
+    """Long sustained chords, one per bar."""
+    notes = []
+    for bar in range(bars):
+        chord = CHORDS[bar % len(CHORDS)]
+        for pitch in chord:
+            notes.extend([pitch, float(bar * 4), 3.8, 70, 0])
+    return notes
+
+
+def make_pad_rhythmic(bars=4):
+    """Short rhythmic chord stabs."""
+    stab_beats = [0.0, 1.0, 2.5, 3.0]
+    notes = []
+    for bar in range(bars):
+        chord = CHORDS[bar % len(CHORDS)]
+        for sb in stab_beats:
+            for pitch in chord:
+                notes.extend([pitch, bar * 4 + sb, 0.25, 85, 0])
+    return notes
+
+
+# ---------------------------------------------------------------------------
+# Lead melody
+# ---------------------------------------------------------------------------
+
+
+def make_lead(bars=4):
+    """4-bar melody outlining the Cm-Fm-Ab-Bb progression."""
+    phrase = [
+        # Bar 1 (Cm)
+        (67, 0.0, 0.75, 95),  # G4
+        (70, 1.0, 0.5, 85),  # Bb4
+        (72, 1.5, 1.5, 100),  # C5
+        (70, 3.0, 0.5, 80),  # Bb4
+        (67, 3.5, 0.5, 75),  # G4
+        # Bar 2 (Fm)
+        (65, 4.0, 1.0, 90),  # F4
+        (68, 5.0, 0.5, 85),  # Ab4
+        (72, 5.5, 1.5, 95),  # C5
+        (68, 7.0, 0.5, 70),  # Ab4
+        (65, 7.5, 0.5, 75),  # F4
+        # Bar 3 (Ab) - climax
+        (63, 8.0, 0.75, 90),  # Eb4
+        (68, 9.0, 0.5, 85),  # Ab4
+        (72, 9.5, 1.0, 95),  # C5
+        (75, 10.5, 1.5, 100),  # Eb5
+        # Bar 4 (Bb) - descend
+        (74, 12.0, 1.0, 95),  # D5
+        (70, 13.0, 0.5, 85),  # Bb4
+        (65, 13.5, 1.0, 80),  # F4
+        (62, 14.5, 1.5, 75),  # D4
+    ]
+    notes = []
+    phrase_len = 16
+    for rep in range(max(1, (bars * 4) // phrase_len)):
+        offset = rep * phrase_len
+        for pitch, start, dur, vel in phrase:
+            notes.extend([pitch, start + offset, dur, vel, 0])
+    return notes
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -307,6 +485,15 @@ def load_drum_kit(api, track, name=None):
     print(f"  Track {track}: loaded drum kit" + (f" '{name}'" if name else ""))
 
 
+def load_effect(api, track, name):
+    """Select a track and load an audio effect by name."""
+    api.view.set("selected_track", track)
+    time.sleep(0.1)
+    api.browser.call("load_audio_effect", name)
+    time.sleep(0.5)
+    print(f"  Track {track}: loaded effect '{name}'")
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -316,35 +503,91 @@ def main():
     api = LiveAPI()
     bars = 4
     beats = bars * 4
-    bpm = 128
+    bpm = 124
 
-    print(f"Setting tempo to {bpm} BPM...")
-    api.song.set("tempo", float(bpm))
-
+    # --- Global setup ---
+    print("Setting up session...")
     api.song.call("stop_playing")
     time.sleep(0.2)
+    api.song.set("tempo", float(bpm))
+    api.song.set("groove_amount", 0.25)
+    api.song.set("metronome", False)
 
-    # Load instruments via browser API
+    # --- Load instruments (expects 4 MIDI tracks) ---
     print("\nLoading instruments...")
     load_drum_kit(api, track=0)
     load_instrument(api, track=1, name="Drift")
+    load_instrument(api, track=2, name="Drift")
+    load_instrument(api, track=3, name="Drift")
 
-    # Create clips
-    print(f"\nCreating {bars}-bar clips...")
-    drum_notes = make_kick(bars) + make_hihat(bars) + make_clap(bars)
-    create_clip(api, track=0, slot=0, length=beats, notes=drum_notes, name="Drums")
+    # Name tracks
+    api.track(0).set("name", "Drums")
+    api.track(1).set("name", "Bass")
+    api.track(2).set("name", "Pad")
+    api.track(3).set("name", "Lead")
 
-    bass_notes = make_bass(bars)
-    create_clip(api, track=1, slot=0, length=beats, notes=bass_notes, name="Bass")
+    # --- Effects ---
+    print("\nLoading effects...")
+    load_effect(api, track=2, name="Reverb")
+    load_effect(api, track=3, name="Delay")
 
-    # Fire and play
-    print("\nFiring clips...")
-    api.clip_slot(0, 0).call("fire")
-    api.clip_slot(1, 0).call("fire")
+    # --- Mix ---
+    api.track(0).set("volume", 0.85)
+    api.track(1).set("volume", 0.80)
+    api.track(2).set("volume", 0.65)
+    api.track(3).set("volume", 0.70)
+    api.track(2).set("panning", -0.15)
+    api.track(3).set("panning", 0.15)
+
+    # --- Create clips across 5 scenes ---
+    print(f"\nCreating {bars}-bar clips across 5 scenes...")
+
+    # Scene 0: Intro — hats + pad only
+    create_clip(api, 0, 0, beats, make_intro_drums(bars), "Intro Drums")
+    create_clip(api, 2, 0, beats, make_pad_sustained(bars), "Intro Pad")
+
+    # Scene 1: Build — full drums + bass enters + pad
+    create_clip(api, 0, 1, beats, make_build_drums(bars), "Build Drums")
+    create_clip(api, 1, 1, beats, make_build_bass(bars), "Build Bass")
+    create_clip(api, 2, 1, beats, make_pad_sustained(bars), "Build Pad")
+
+    # Scene 2: Drop — everything, rhythmic stabs, lead enters
+    drop_drums = make_kick(bars) + make_hihat(bars) + make_clap(bars)
+    create_clip(api, 0, 2, beats, drop_drums, "Drop Drums")
+    create_clip(api, 1, 2, beats, make_drop_bass(bars), "Drop Bass")
+    create_clip(api, 2, 2, beats, make_pad_rhythmic(bars), "Drop Pad")
+    create_clip(api, 3, 2, beats, make_lead(bars), "Lead")
+
+    # Scene 3: Breakdown — sparse drums, walking bass, sustained pad
+    create_clip(api, 0, 3, beats, make_breakdown_drums(bars), "Break Drums")
+    create_clip(api, 1, 3, beats, make_breakdown_bass(bars), "Break Bass")
+    create_clip(api, 2, 3, beats, make_pad_sustained(bars), "Break Pad")
+
+    # Scene 4: Finale — full energy, driving bass, lead returns
+    create_clip(api, 0, 4, beats, drop_drums, "Finale Drums")
+    create_clip(api, 1, 4, beats, make_finale_bass(bars), "Finale Bass")
+    create_clip(api, 2, 4, beats, make_pad_rhythmic(bars), "Finale Pad")
+    create_clip(api, 3, 4, beats, make_lead(bars), "Finale Lead")
+
+    # Name scenes
+    scene_names = ["Intro", "Build", "Drop", "Breakdown", "Finale"]
+    for i, name in enumerate(scene_names):
+        api.scene(i).set("name", name)
+
+    # --- Play through the set ---
+    print("\nStarting set...")
     api.song.call("start_playing")
-    print("Playing! Press Ctrl+C to stop.")
+
+    scene_bars = [4, 4, 8, 4, 8]  # how long to hold each scene
+    bar_duration = 4 * 60.0 / bpm
 
     try:
+        for i, (name, nbars) in enumerate(zip(scene_names, scene_bars)):
+            print(f"  >>> {name} ({nbars} bars)")
+            api.scene(i).call("fire")
+            time.sleep(nbars * bar_duration)
+
+        print("\nSet complete — looping finale. Press Ctrl+C to stop.")
         while True:
             time.sleep(1)
     except KeyboardInterrupt:
