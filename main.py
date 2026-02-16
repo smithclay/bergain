@@ -14,6 +14,8 @@ from pythonosc.osc_message import OscMessage
 from spec_data import spec as _ableton_spec
 
 import requests
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 REMOTE_PORT = 11000
 LOCAL_PORT = 11001
@@ -550,6 +552,20 @@ def make_lead(bars=4):
 # ---------------------------------------------------------------------------
 
 
+MAX_NOTES_PER_MSG = 200  # ~200 notes × 5 values × ~8 bytes = ~8KB, well under UDP limit
+
+
+def _send_notes_batched(send_fn, notes):
+    """Send notes in batches to avoid UDP packet size limits."""
+    values_per_note = 5
+    total = len(notes) // values_per_note
+    for i in range(0, total, MAX_NOTES_PER_MSG):
+        chunk = notes[i * values_per_note : (i + MAX_NOTES_PER_MSG) * values_per_note]
+        send_fn(chunk)
+        if i + MAX_NOTES_PER_MSG < total:
+            time.sleep(0.05)
+
+
 def create_clip(api, track, slot, length, notes, name):
     """Create a MIDI clip, populate it with notes, and name it."""
     cs = api.clip_slot(track, slot)
@@ -560,41 +576,66 @@ def create_clip(api, track, slot, length, notes, name):
     cs.call("create_clip", float(length))
     time.sleep(0.1)
 
-    api.clip(track, slot).call("add/notes", *notes)
+    _send_notes_batched(
+        lambda chunk: api.clip(track, slot).call("add/notes", *chunk), notes
+    )
     api.clip(track, slot).set("name", name)
     print(
         f"  Track {track}, slot {slot}: '{name}' ({length} beats, {len(notes) // 5} notes)"
     )
 
 
-def load_instrument(api, track, name):
-    """Select a track and load an instrument by name via the browser API."""
+def _browser_load(api, track, method, name, wait=1.0):
+    """Load a browser item onto a track, with error handling.
+
+    Uses query (not fire-and-forget) so we detect failures.
+    Returns the loaded item name, or None on failure.
+    """
     api.view.set("selected_track", track)
     time.sleep(0.1)
-    api.browser.call("load_instrument", name)
-    time.sleep(1.0)
-    print(f"  Track {track}: loaded '{name}'")
+    try:
+        result = api.browser.query(method, name) if name else api.browser.query(method)
+        loaded = result[0] if result else name
+        time.sleep(wait)
+        return loaded
+    except TimeoutError:
+        return None
+
+
+def load_instrument(api, track, name):
+    """Select a track and load an instrument by name via the browser API."""
+    loaded = _browser_load(api, track, "load_instrument", name)
+    if loaded:
+        print(f"  Track {track}: loaded instrument '{loaded}'")
+    else:
+        print(f"  Track {track}: FAILED to load instrument '{name}'")
 
 
 def load_drum_kit(api, track, name=None):
     """Select a track and load a drum kit via the browser API."""
-    api.view.set("selected_track", track)
-    time.sleep(0.1)
-    if name:
-        api.browser.call("load_drum_kit", name)
+    loaded = _browser_load(api, track, "load_drum_kit", name)
+    if loaded:
+        print(f"  Track {track}: loaded drum kit '{loaded}'")
     else:
-        api.browser.call("load_drum_kit")
-    time.sleep(1.0)
-    print(f"  Track {track}: loaded drum kit" + (f" '{name}'" if name else ""))
+        print(f"  Track {track}: FAILED to load drum kit '{name}'")
+
+
+def load_sound(api, track, name):
+    """Select a track and load a sound preset by name via the browser Sounds category."""
+    loaded = _browser_load(api, track, "load_sound", name)
+    if loaded:
+        print(f"  Track {track}: loaded sound '{loaded}'")
+    else:
+        print(f"  Track {track}: FAILED to load sound '{name}'")
 
 
 def load_effect(api, track, name):
     """Select a track and load an audio effect by name."""
-    api.view.set("selected_track", track)
-    time.sleep(0.1)
-    api.browser.call("load_audio_effect", name)
-    time.sleep(0.5)
-    print(f"  Track {track}: loaded effect '{name}'")
+    loaded = _browser_load(api, track, "load_audio_effect", name, wait=0.5)
+    if loaded:
+        print(f"  Track {track}: loaded effect '{loaded}'")
+    else:
+        print(f"  Track {track}: FAILED to load effect '{name}'")
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +680,12 @@ def create_arrangement_clip_with_notes(api, track, start, length, notes, name):
     clip_idx = result[1]
     time.sleep(0.15)
     if notes:
-        api._osc.send("/live/arrangement_clip/add/notes", [track, clip_idx] + notes)
+        _send_notes_batched(
+            lambda chunk: api._osc.send(
+                "/live/arrangement_clip/add/notes", [track, clip_idx] + chunk
+            ),
+            notes,
+        )
     api.arrangement_clip(track, clip_idx).set("name", name)
     time.sleep(0.1)
     return clip_idx
@@ -671,6 +717,246 @@ def print_arrangement(api, num_tracks):
                 print(f"    {track_name:8s} | bar {bar:3d} | '{cn}'")
         except TimeoutError:
             pass
+
+
+# ---------------------------------------------------------------------------
+# Device parameter helpers
+# ---------------------------------------------------------------------------
+
+
+def get_device_params(api, track, device):
+    """Get parameter names for a device on a track."""
+    try:
+        result = api._osc.query(
+            "/live/device/get/parameters/name", [track, device], timeout=2.0
+        )
+        return list(result[2:]) if len(result) > 2 else []
+    except TimeoutError:
+        return []
+
+
+def find_param_index(params, name_fragment):
+    """Find a parameter index by partial name match (case-insensitive)."""
+    fragment = name_fragment.lower()
+    for i, name in enumerate(params):
+        if fragment in str(name).lower():
+            return i
+    return None
+
+
+def set_device_param(api, track, device, param_idx, value):
+    """Set a device parameter value."""
+    api._osc.send(
+        "/live/device/set/parameter/value", [track, device, param_idx, float(value)]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Note helpers
+# ---------------------------------------------------------------------------
+
+
+def notes(tuples):
+    """Convert [(pitch, start, dur, vel), ...] to flat wire format."""
+    flat = []
+    for p, s, d, v in tuples:
+        flat.extend([p, float(s), float(d), v, 0])
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# Set / Track / Scene
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class Track:
+    """Declares a track's instrument, effects, and mix."""
+
+    name: str
+    sound: str | None = None
+    instrument: str | None = None
+    drum_kit: str | None = None
+    effects: list[str] = field(default_factory=list)
+    volume: float = 0.85
+    pan: float = 0.0
+
+
+@dataclass
+class Scene:
+    """A row of clips across tracks (Ableton's term for a session view row)."""
+
+    name: str
+    bars: int
+    clips: dict[str, Callable]
+    on_enter: Callable | None = None
+
+
+class Set:
+    """A persistent session with tracks/effects/mix — Ableton's 'Live Set'.
+
+    Usage:
+        s = Set("My Set", bpm=120, tracks=[...])
+        s.setup()
+        s.load_scenes(scenes)
+        s.build_arrangement(scenes)
+        s.play()
+        s.teardown()
+    """
+
+    def __init__(
+        self,
+        name,
+        bpm,
+        tracks,
+        beats_per_bar=4,
+        groove=0.0,
+        metronome=False,
+        time_sig=None,
+        subtitle=None,
+    ):
+        self.name = name
+        self.subtitle = subtitle
+        self.bpm = bpm
+        self.tracks = tracks
+        self.beats_per_bar = beats_per_bar
+        self.groove = groove
+        self.metronome = metronome
+        self.time_sig = time_sig
+        self.api = None
+        self._track_index = {}
+        self._n_tracks = 0
+        self._scenes = []
+
+    def setup(self):
+        """Connect to Ableton, create tracks, load instruments/effects, set mix."""
+        self.api = LiveAPI()
+        self.api.song.call("stop_playing")
+        time.sleep(0.2)
+
+        print(f"=== {self.name.upper()} ===")
+        if self.subtitle:
+            print(f"=== {self.subtitle} ===")
+        print()
+
+        self.api.song.set("tempo", float(self.bpm))
+        self.api.song.set("groove_amount", self.groove)
+        self.api.song.set("metronome", self.metronome)
+
+        if self.time_sig:
+            try:
+                self.api.song.set("signature_numerator", self.time_sig[0])
+                self.api.song.set("signature_denominator", self.time_sig[1])
+            except Exception:
+                pass
+
+        sig = f", {self.time_sig[0]}/{self.time_sig[1]}" if self.time_sig else ""
+        print(f"  {self.bpm} BPM{sig}\n")
+
+        # Build track specs
+        def _make_loader(t):
+            if t.instrument:
+                return lambda a, i: load_instrument(a, i, t.instrument)
+            elif t.drum_kit:
+                return lambda a, i: load_drum_kit(a, i, t.drum_kit)
+            elif t.sound:
+                return lambda a, i: load_sound(a, i, t.sound)
+            return None
+
+        track_specs = [(t.name, _make_loader(t)) for t in self.tracks]
+
+        self._n_tracks = setup_tracks(self.api, track_specs)
+        self._track_index = {t.name: i for i, t in enumerate(self.tracks)}
+
+        # Load effects
+        for i, t in enumerate(self.tracks):
+            for effect_name in t.effects:
+                load_effect(self.api, track=i, name=effect_name)
+
+        # Set mix
+        for i, t in enumerate(self.tracks):
+            self.api.track(i).set("volume", t.volume)
+            self.api.track(i).set("panning", t.pan)
+
+    def load_scenes(self, scenes):
+        """Create session clips from scenes. Each Scene becomes an Ableton scene."""
+        self._scenes = scenes
+        print("\n  Session clips:")
+        for scene_idx, scene in enumerate(scenes):
+            clip_beats = scene.bars * self.beats_per_bar
+            for track_name, fn in scene.clips.items():
+                t = self._track_index[track_name]
+                clip_name = f"{scene.name} {track_name}"
+                create_clip(
+                    self.api, t, scene_idx, clip_beats, fn(scene.bars), clip_name
+                )
+            self.api.scene(scene_idx).set("name", scene.name)
+
+    def build_arrangement(self, scenes):
+        """Create arrangement clips from scenes, laid out linearly."""
+        self._scenes = scenes
+        clear_arrangement(self.api, self._n_tracks)
+        total_bars = sum(s.bars for s in scenes)
+        total_secs = total_bars * self.beats_per_bar * 60.0 / self.bpm
+        time_str = (
+            f"{total_secs / 60:.0f} min" if total_secs >= 120 else f"{total_secs:.0f}s"
+        )
+        print(f"\n  Arrangement ({total_bars} bars, {time_str}):")
+
+        beat_offset = 0
+        for scene in scenes:
+            sec_beats = scene.bars * self.beats_per_bar
+            bar_start = beat_offset // self.beats_per_bar + 1
+            bar_end = bar_start + scene.bars - 1
+            active = " ".join(
+                "X" if t.name in scene.clips else "." for t in self.tracks
+            )
+            print(f"    {scene.name:20s} bars {bar_start:3d}-{bar_end:3d}  [{active}]")
+
+            for track_name, fn in scene.clips.items():
+                t_idx = self._track_index[track_name]
+                clip_name = f"{scene.name} {track_name}"
+                create_arrangement_clip_with_notes(
+                    self.api, t_idx, beat_offset, sec_beats, fn(scene.bars), clip_name
+                )
+            beat_offset += sec_beats
+
+        print_arrangement(self.api, self._n_tracks)
+
+    def play(self):
+        """Play arrangement linearly, calling on_enter hooks per scene."""
+        bar_dur = self.beats_per_bar * 60.0 / self.bpm
+        total_bars = sum(s.bars for s in self._scenes)
+        total_secs = total_bars * bar_dur
+        time_str = (
+            f"{total_secs / 60:.0f} min" if total_secs >= 120 else f"{total_secs:.0f}s"
+        )
+        print(f"\n  Playing... ({time_str})")
+        self.api.song.set("current_song_time", 0.0)
+        time.sleep(0.1)
+        self.api.song.call("start_playing")
+
+        try:
+            for scene in self._scenes:
+                if scene.on_enter:
+                    scene.on_enter(self.api)
+                secs = scene.bars * bar_dur
+                sec_str = f"{secs / 60:.1f} min" if secs >= 120 else f"{secs:.0f}s"
+                print(f"    >>> {scene.name} ({scene.bars} bars, {sec_str})")
+                time.sleep(secs)
+        except KeyboardInterrupt:
+            pass
+
+        self.api.song.call("stop_playing")
+
+    def teardown(self):
+        """Stop playback + disconnect."""
+        self.api.song.call("stop_playing")
+        self.api.stop()
+
+    def track_index(self, name):
+        """Resolve track name to index."""
+        return self._track_index[name]
 
 
 def demo_full(api):
@@ -705,10 +991,10 @@ def demo_full(api):
     n_tracks = setup_tracks(
         api,
         [
-            ("Drums", lambda a, t: load_drum_kit(a, t)),
-            ("Bass", lambda a, t: load_instrument(a, t, "Drift")),
-            ("Pad", lambda a, t: load_instrument(a, t, "Drift")),
-            ("Lead", lambda a, t: load_instrument(a, t, "Drift")),
+            ("Drums", lambda a, t: load_drum_kit(a, t, "Kit-808 Classic")),
+            ("Bass", lambda a, t: load_sound(a, t, "Bass")),
+            ("Pad", lambda a, t: load_sound(a, t, "Pad")),
+            ("Lead", lambda a, t: load_sound(a, t, "Lead")),
         ],
     )
 
