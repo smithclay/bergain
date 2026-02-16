@@ -43,8 +43,10 @@ class Session:
     one-call methods for common operations.
     """
 
-    def __init__(self, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT):
-        self.api = LiveAPI(hostname, port, client_port)
+    def __init__(
+        self, api=None, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT
+    ):
+        self.api = api or LiveAPI(hostname, port, client_port)
         self._tracks = {}  # name -> index
         self._scenes = {}  # name -> index
         self._param_cache = {}  # (track_idx, device_idx) -> [param_names]
@@ -91,8 +93,24 @@ class Session:
     # -- Clips -------------------------------------------------------------------
 
     def clip(self, track, slot, length, tuples, name=""):
-        """Create a session MIDI clip from note tuples."""
+        """Create a session MIDI clip from note tuples.
+
+        Auto-creates scenes if slot index exceeds current scene count.
+        Returns {"track": int, "slot": int, "name": str, "beats": float, "notes": int}.
+        """
         t = self._t(track)
+        # Auto-create scenes if needed
+        try:
+            num_scenes = self.api.song.get("num_scenes")
+            while slot >= num_scenes:
+                self.api.song.call("create_scene", num_scenes)
+                time.sleep(0.1)
+                num_scenes += 1
+        except TimeoutError as e:
+            raise TimeoutError(
+                f"Could not check/create scenes for slot {slot}. "
+                f"Current scene count may be insufficient. Original: {e}"
+            ) from e
         cs = self.api.clip_slot(t, slot)
         if cs.get("has_clip"):
             cs.call("delete_clip")
@@ -104,12 +122,24 @@ class Session:
             self.api.clip(t, slot).send_batched("add/notes", wire)
         if name:
             self.api.clip(t, slot).set("name", name)
+        result = {
+            "track": t,
+            "slot": slot,
+            "name": name,
+            "beats": length,
+            "notes": len(tuples),
+        }
         print(
             f"  Track {t}, slot {slot}: '{name}' ({length} beats, {len(tuples)} notes)"
         )
+        return result
 
     def arr_clip(self, track, start, length, tuples, name=""):
-        """Create an arrangement clip from note tuples. Returns clip index."""
+        """Create an arrangement clip from note tuples.
+
+        Returns {"track": int, "clip_index": int, "start": float,
+                 "beats": float, "name": str, "notes": int}.
+        """
         t = self._t(track)
         result = self.api.track(t).query(
             "create_arrangement_clip", float(start), float(length), timeout=3.0
@@ -122,7 +152,30 @@ class Session:
         if name:
             self.api.arrangement_clip(t, clip_idx).set("name", name)
         time.sleep(0.1)
-        return clip_idx
+        return {
+            "track": t,
+            "clip_index": clip_idx,
+            "start": start,
+            "beats": length,
+            "name": name,
+            "notes": len(tuples),
+        }
+
+    def fire_clip(self, track, slot=0):
+        """Fire a clip by track name and slot index."""
+        t = self._t(track)
+        self.api.clip_slot(t, slot).call("fire")
+
+    def stop_clip(self, track, slot=None):
+        """Stop the playing clip on a track.
+
+        If slot is None, stops whatever's playing on the track.
+        """
+        t = self._t(track)
+        if slot is not None:
+            self.api.clip_slot(t, slot).call("stop")
+        else:
+            self.api.track(t).call("stop_all_clips")
 
     # -- Scene -------------------------------------------------------------------
 
@@ -132,16 +185,15 @@ class Session:
 
     # -- Device params -----------------------------------------------------------
 
-    def _get_params(self, t, device):
-        result = self.api.device(t, device).query("get/parameters/name", timeout=2.0)
-        return list(result)
-
     def params(self, track, device):
         """Get parameter names for a device (cached)."""
         t = self._t(track)
         key = (t, device)
         if key not in self._param_cache:
-            self._param_cache[key] = self._get_params(t, device)
+            result = self.api.device(t, device).query(
+                "get/parameters/name", timeout=2.0
+            )
+            self._param_cache[key] = list(result)
         return self._param_cache[key]
 
     def param(self, track, device, name, value=None):
@@ -165,6 +217,41 @@ class Session:
 
     # -- Browser loading ---------------------------------------------------------
 
+    def browse(self, query, category=None):
+        """Search Ableton browser, return structured results.
+
+        Returns list of {"category": ..., "name": ...} dicts.
+        Optionally filter by category substring (case-insensitive).
+        """
+        raw = self.api.browser.query("search", query)
+        if not raw:
+            return []
+        results = list(raw)
+        pairs = [
+            {"category": results[i], "name": results[i + 1]}
+            for i in range(0, len(results), 2)
+        ]
+        if category:
+            pairs = [p for p in pairs if category.lower() in p["category"].lower()]
+        return pairs
+
+    def load(self, track, name):
+        """Load a browser item by name, auto-detecting type.
+
+        Tries instrument -> sound -> drum_kit -> effect in order.
+        Returns {"type": ..., "name": ...} on success, None on failure.
+        """
+        for method, label in [
+            ("load_instrument", "instrument"),
+            ("load_sound", "sound"),
+            ("load_drum_kit", "drum kit"),
+            ("load_audio_effect", "effect"),
+        ]:
+            result = self._browser_load(track, method, name, label, wait=0.5)
+            if result:
+                return {"type": label, "name": result}
+        return None
+
     def _browser_load(self, track, method, name, label, wait=1.0):
         """Load a browser item onto a track, printing success/failure."""
         t = self._t(track)
@@ -186,19 +273,19 @@ class Session:
 
     def load_instrument(self, track, name):
         """Load an instrument by name onto a track."""
-        self._browser_load(track, "load_instrument", name, "instrument")
+        return self._browser_load(track, "load_instrument", name, "instrument")
 
     def load_drum_kit(self, track, name=None):
         """Load a drum kit onto a track."""
-        self._browser_load(track, "load_drum_kit", name, "drum kit")
+        return self._browser_load(track, "load_drum_kit", name, "drum kit")
 
     def load_sound(self, track, name):
         """Load a sound preset onto a track."""
-        self._browser_load(track, "load_sound", name, "sound")
+        return self._browser_load(track, "load_sound", name, "sound")
 
     def load_effect(self, track, name):
         """Load an audio effect onto a track."""
-        self._browser_load(track, "load_audio_effect", name, "effect", wait=0.5)
+        return self._browser_load(track, "load_audio_effect", name, "effect", wait=0.5)
 
     # -- Track setup -------------------------------------------------------------
 
@@ -242,6 +329,25 @@ class Session:
         self.refresh()
         return len(tracks)
 
+    # -- Mix ---------------------------------------------------------------------
+
+    def mix(self, **levels):
+        """Set volume/pan for multiple tracks at once.
+
+        Usage:
+            sesh.mix(Kick=0.85, Hats=0.55)
+            sesh.mix(Kick={"volume": 0.85, "pan": -0.1})
+        """
+        for track_name, val in levels.items():
+            t = self._t(track_name)
+            if isinstance(val, dict):
+                if "volume" in val:
+                    self.api.track(t).set("volume", float(val["volume"]))
+                if "pan" in val:
+                    self.api.track(t).set("panning", float(val["pan"]))
+            else:
+                self.api.track(t).set("volume", float(val))
+
     # -- Arrangement -------------------------------------------------------------
 
     def clear_arrangement(self, tracks=None):
@@ -259,9 +365,12 @@ class Session:
                 except Exception:
                     break
 
-    def print_arrangement(self):
-        """Print the full arrangement layout."""
-        print("\n  Arrangement layout:")
+    def arrangement(self):
+        """Return and print arrangement clip layout.
+
+        Returns list of {"track": str, "bar": int, "name": str, "start_time": float}.
+        """
+        clips = []
         num_tracks = self.api.song.get("num_tracks")
         for t in range(num_tracks):
             try:
@@ -276,9 +385,17 @@ class Session:
                 track_name = self.api.track(t).get("name")
                 for cn, ct in zip(clip_names, clip_times):
                     bar = int(ct) // 4 + 1
-                    print(f"    {track_name:8s} | bar {bar:3d} | '{cn}'")
+                    clips.append(
+                        {"track": track_name, "bar": bar, "name": cn, "start_time": ct}
+                    )
             except TimeoutError:
                 pass
+        print("\n  Arrangement layout:")
+        for c in clips:
+            print(f"    {c['track']:8s} | bar {c['bar']:3d} | '{c['name']}'")
+        if not clips:
+            print("    (empty)")
+        return clips
 
     # -- Transport ---------------------------------------------------------------
 
@@ -298,45 +415,94 @@ class Session:
     def seek(self, beat):
         self.api.song.set("current_song_time", float(beat))
 
-    # -- Info --------------------------------------------------------------------
+    def fade(self, track, target_volume, steps=4, duration=1.0):
+        """Gradually change track volume over duration.
 
-    def info(self):
-        """Print current song state."""
-        print("--- Song Info ---")
-        print(f"  Tempo:    {self.api.song.get('tempo')} BPM")
-        print(f"  Tracks:   {self.api.song.get('num_tracks')}")
-        print(f"  Scenes:   {self.api.song.get('num_scenes')}")
+        Returns {"track": int, "from": float, "to": float}.
+        """
+        t = self._t(track)
+        current = self.api.track(t).get("volume")
+        step_time = duration / steps
+        for i in range(1, steps + 1):
+            val = current + (target_volume - current) * (i / steps)
+            self.api.track(t).set("volume", float(val))
+            if i < steps:
+                time.sleep(step_time)
+        return {"track": t, "from": current, "to": target_volume}
+
+    # -- Status / Info -----------------------------------------------------------
+
+    def status(self):
+        """Return structured snapshot of current session state.
+
+        Returns dict with tempo, playing, time_signature, and per-track info
+        (name, volume, pan, muted, soloed, devices, playing_slot).
+        """
+        tempo = self.api.song.get("tempo")
+        playing = self.api.song.get("is_playing")
         sig_num = self.api.song.get("signature_numerator")
         sig_den = self.api.song.get("signature_denominator")
-        print(f"  Time sig: {sig_num}/{sig_den}")
         num_tracks = self.api.song.get("num_tracks")
-        print("\n  Tracks:")
-        for t in range(num_tracks):
-            name = self.api.track(t).get("name")
-            devs = self.api.track(t).get("num_devices")
-            midi = self.api.track(t).get("has_midi_input")
-            print(f"    [{t}] {name} ({'MIDI' if midi else 'Audio'}, {devs} devices)")
-        print("\n  Arrangement:")
-        has_clips = False
-        for t in range(num_tracks):
+
+        tracks = []
+        for i in range(num_tracks):
+            name = self.api.track(i).get("name")
+            vol = self.api.track(i).get("volume")
+            pan = self.api.track(i).get("panning")
+            muted = self.api.track(i).get("mute")
+            soloed = self.api.track(i).get("solo")
+            num_devs = self.api.track(i).get("num_devices")
+            devices = []
+            for d in range(num_devs):
+                try:
+                    dev_name = self.api.device(i, d).get("name")
+                    devices.append(dev_name)
+                except TimeoutError:
+                    break
+            playing_slot = None
             try:
-                name_result = self.api.track(t).query(
-                    "get/arrangement_clips/name", timeout=2.0
-                )
-                time_result = self.api.track(t).query(
-                    "get/arrangement_clips/start_time", timeout=2.0
-                )
-                clip_names = list(name_result) if name_result else []
-                clip_times = list(time_result) if time_result else []
-                track_name = self.api.track(t).get("name")
-                for cn, ct in zip(clip_names, clip_times):
-                    bar = int(ct) // 4 + 1
-                    print(f"    {track_name:8s} | bar {bar:3d} | '{cn}'")
-                    has_clips = True
+                playing_slot = self.api.track(i).get("playing_slot_index")
             except TimeoutError:
                 pass
-        if not has_clips:
-            print("    (empty)")
+            tracks.append(
+                {
+                    "index": i,
+                    "name": name,
+                    "volume": vol,
+                    "pan": pan,
+                    "muted": muted,
+                    "soloed": soloed,
+                    "devices": devices,
+                    "playing_slot": playing_slot,
+                }
+            )
+
+        return {
+            "tempo": tempo,
+            "playing": playing,
+            "time_signature": f"{sig_num}/{sig_den}",
+            "tracks": tracks,
+        }
+
+    def info(self):
+        """Pretty-print current session state. Returns the status() dict."""
+        s = self.status()
+        print("--- Song Info ---")
+        print(f"  Tempo:    {s['tempo']} BPM")
+        print(f"  Time sig: {s['time_signature']}")
+        print(f"  Playing:  {s['playing']}")
+        print(f"\n  Tracks ({len(s['tracks'])}):")
+        for t in s["tracks"]:
+            devs = ", ".join(t["devices"]) if t["devices"] else "no devices"
+            slot = (
+                f" [playing slot {t['playing_slot']}]"
+                if t["playing_slot"] not in (None, -1)
+                else ""
+            )
+            print(
+                f"    [{t['index']}] {t['name']} vol={t['volume']:.2f} pan={t['pan']:.2f} ({devs}){slot}"
+            )
+        return s
 
     # -- Lifecycle ---------------------------------------------------------------
 
@@ -401,6 +567,7 @@ class Set:
         metronome=False,
         time_sig=None,
         subtitle=None,
+        api=None,
     ):
         self.name = name
         self.subtitle = subtitle
@@ -410,12 +577,13 @@ class Set:
         self.groove = groove
         self.metronome = metronome
         self.time_sig = time_sig
+        self._api = api
         self.session = None
         self._scenes = []
 
     def setup(self):
         """Connect to Ableton, create tracks, load instruments/effects, set mix."""
-        self.session = Session()
+        self.session = Session(api=self._api)
         self.session.stop()
         time.sleep(0.2)
 
@@ -478,7 +646,7 @@ class Set:
                 )
             beat_offset += sec_beats
 
-        self.session.print_arrangement()
+        self.session.arrangement()
 
     def play(self, scenes=None):
         """Play arrangement linearly, calling on_enter hooks per scene."""

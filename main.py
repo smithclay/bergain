@@ -27,7 +27,9 @@ class AbletonOSC:
     to our listening port (the fork replies to the sender's address).
     """
 
-    def __init__(self, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT):
+    def __init__(
+        self, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT, retries=0
+    ):
         self._remote = (hostname, port)
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -35,6 +37,7 @@ class AbletonOSC:
         self._sock.setblocking(False)
         self._handlers = {}
         self._lock = threading.Lock()
+        self._retries = retries
 
         self._running = True
         self._thread = threading.Thread(target=self._recv_loop, daemon=True)
@@ -72,23 +75,28 @@ class AbletonOSC:
 
     def query(self, address: str, params=(), timeout: float = TICK_DURATION):
         """Send an OSC message and wait for the reply."""
-        rv = None
-        event = threading.Event()
+        last_err = None
+        for attempt in range(1 + self._retries):
+            if attempt > 0:
+                time.sleep(0.2 * attempt)
+            rv = None
+            event = threading.Event()
 
-        def on_reply(_addr, p):
-            nonlocal rv
-            rv = tuple(p)
-            event.set()
+            def on_reply(_addr, p):
+                nonlocal rv
+                rv = tuple(p)
+                event.set()
 
-        with self._lock:
-            self._handlers[address] = on_reply
-        self._sock.sendto(self._build_msg(address, params), self._remote)
-        event.wait(timeout)
-        with self._lock:
-            self._handlers.pop(address, None)
-        if not event.is_set():
-            raise TimeoutError(f"No response from Ableton for: {address}")
-        return rv
+            with self._lock:
+                self._handlers[address] = on_reply
+            self._sock.sendto(self._build_msg(address, params), self._remote)
+            event.wait(timeout)
+            with self._lock:
+                self._handlers.pop(address, None)
+            if event.is_set():
+                return rv
+            last_err = TimeoutError(f"No response from Ableton for: {address}")
+        raise last_err
 
     def stop(self):
         self._running = False
@@ -161,8 +169,10 @@ class LiveAPI:
         api.clip(0, 0).set("name", "Drums")
     """
 
-    def __init__(self, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT):
-        self._osc = AbletonOSC(hostname, port, client_port)
+    def __init__(
+        self, hostname="127.0.0.1", port=REMOTE_PORT, client_port=LOCAL_PORT, retries=0
+    ):
+        self._osc = AbletonOSC(hostname, port, client_port, retries=retries)
         self._spec = _ableton_spec
         self._addresses = {ep.address for d in self._spec.domains for ep in d.endpoints}
         self._domains = {d.name: d for d in self._spec.domains}
