@@ -612,6 +612,66 @@ track_domain = DomainSpec(
         )
         + _bulk_props("track", [], _track_mixer_rw, idx=_track_idx, wildcard=True)
         + _track_custom
+        + [
+            # Arrangement clip track-level operations (from arrangement_clip.py)
+            _custom(
+                "/live/track/create_arrangement_clip",
+                "track",
+                kind="method",
+                params=[_track, _p("start_time", "float"), _p("length", "float")],
+                returns=[_track, _p("clip_id", "int")],
+                desc="Create MIDI clip in arrangement (Live 12+)",
+                wildcard=True,
+            ),
+            _custom(
+                "/live/track/delete_arrangement_clip",
+                "track",
+                kind="method",
+                params=[_track, _p("clip_id", "int")],
+                desc="Delete arrangement clip",
+                wildcard=True,
+            ),
+            _custom(
+                "/live/track/duplicate_to_arrangement",
+                "track",
+                kind="method",
+                params=[_track, _p("clip_slot_id", "int"), _p("dest_time", "float")],
+                returns=[_track, _p("clip_id", "int")],
+                desc="Copy session clip to arrangement at dest_time",
+                wildcard=True,
+            ),
+            _custom(
+                "/live/track/split_arrangement_clip",
+                "track",
+                kind="method",
+                params=[_track, _p("clip_id", "int"), _p("split_time", "float")],
+                returns=[
+                    _track,
+                    _p("original_clip_id", "int"),
+                    _p("new_clip_id", "int"),
+                ],
+                desc="Split arrangement clip at split_time",
+                wildcard=True,
+            ),
+            _custom(
+                "/live/track/move_arrangement_clip",
+                "track",
+                kind="method",
+                params=[_track, _p("clip_id", "int"), _p("new_start", "float")],
+                returns=[_track, _p("new_clip_id", "int")],
+                desc="Move arrangement clip to new_start",
+                wildcard=True,
+            ),
+            _custom(
+                "/live/track/duplicate_arrangement_clip",
+                "track",
+                kind="method",
+                params=[_track, _p("clip_id", "int"), _p("dest_time", "float")],
+                returns=[_track, _p("new_clip_id", "int")],
+                desc="Duplicate arrangement clip to dest_time",
+                wildcard=True,
+            ),
+        ]
     ),
 )
 
@@ -746,6 +806,96 @@ clip_domain = DomainSpec(
         _bulk_methods("clip", _clip_methods, idx=_clip_idx)
         + _bulk_props("clip", _clip_props_ro, _clip_props_rw, idx=_clip_idx)
         + _clip_custom
+    ),
+)
+
+
+# =============================================================================
+# Arrangement Clip domain  (source: abletonosc/arrangement_clip.py)
+# =============================================================================
+
+_ac_idx = [_track, _p("clip_id", "int", "Arrangement clip index")]
+
+_ac_props_ro: list[tuple[str, str]] = [
+    ("start_time", "float"),
+    ("end_time", "float"),
+    ("length", "float"),
+    ("is_midi_clip", "bool"),
+    ("color", "int"),
+]
+
+_ac_props_rw: list[tuple[str, str]] = [
+    ("name", "str"),
+    ("loop_start", "float"),
+    ("loop_end", "float"),
+    ("start_marker", "float"),
+    ("end_marker", "float"),
+    ("looping", "bool"),
+]
+
+_ac_custom: list[EndpointSpec] = [
+    _custom(
+        "/live/arrangement_clip/get/notes",
+        "arrangement_clip",
+        kind="get",
+        params=[
+            _track,
+            _p("clip_id", "int"),
+            _p("pitch_start", "int", optional=True),
+            _p("pitch_span", "int", optional=True),
+            _p("time_start", "float", optional=True),
+            _p("time_span", "float", optional=True),
+        ],
+        returns=[
+            _track,
+            _p("clip_id", "int"),
+            _p(
+                "note_data",
+                "any",
+                "Flattened: pitch, start_time, duration, velocity, mute per note",
+            ),
+        ],
+        desc="Get MIDI notes from arrangement clip",
+    ),
+    _custom(
+        "/live/arrangement_clip/add/notes",
+        "arrangement_clip",
+        kind="custom",
+        params=[
+            _track,
+            _p("clip_id", "int"),
+            _p(
+                "note_data",
+                "any",
+                "Repeating groups of: pitch, start_time, duration, velocity, mute",
+            ),
+        ],
+        desc="Add MIDI notes to arrangement clip",
+    ),
+    _custom(
+        "/live/arrangement_clip/remove/notes",
+        "arrangement_clip",
+        kind="custom",
+        params=[
+            _track,
+            _p("clip_id", "int"),
+            _p("pitch_start", "int", optional=True),
+            _p("pitch_span", "int", optional=True),
+            _p("time_start", "float", optional=True),
+            _p("time_span", "float", optional=True),
+        ],
+        desc="Remove MIDI notes from arrangement clip",
+    ),
+]
+
+arrangement_clip_domain = DomainSpec(
+    name="arrangement_clip",
+    description="Arrangement clip properties, MIDI note manipulation",
+    base_address="/live/arrangement_clip",
+    index_params=[_track, _p("clip_id", "int", "Arrangement clip index")],
+    endpoints=(
+        _bulk_props("arrangement_clip", _ac_props_ro, _ac_props_rw, idx=_ac_idx)
+        + _ac_custom
     ),
 )
 
@@ -911,11 +1061,65 @@ _dev_custom: list[EndpointSpec] = [
         params=[_track, _device, _p("param_index", "int")],
         desc="Stop listening for parameter value changes",
     ),
+    # Chain operations (rack devices)
+    _custom(
+        "/live/device/get/num_chains",
+        "device",
+        kind="get",
+        params=_dev_idx,
+        returns=[_track, _device, _p("count", "int")],
+        desc="Get number of chains (rack devices only)",
+    ),
+    _custom(
+        "/live/device/get/chains/name",
+        "device",
+        kind="get",
+        params=_dev_idx,
+        returns=[_track, _device, _p("names", "str")],
+        desc="Get all chain names",
+    ),
+    _custom(
+        "/live/device/get/chains/mute",
+        "device",
+        kind="get",
+        params=_dev_idx,
+        returns=[_track, _device, _p("mutes", "bool")],
+        desc="Get all chain mute states",
+    ),
+    _custom(
+        "/live/device/get/chains/volume",
+        "device",
+        kind="get",
+        params=_dev_idx,
+        returns=[_track, _device, _p("volumes", "float")],
+        desc="Get all chain volumes",
+    ),
+    _custom(
+        "/live/device/set/chain/name",
+        "device",
+        kind="set",
+        params=[_track, _device, _p("chain_id", "int"), _p("name", "str")],
+        desc="Set chain name",
+    ),
+    _custom(
+        "/live/device/set/chain/volume",
+        "device",
+        kind="set",
+        params=[_track, _device, _p("chain_id", "int"), _p("value", "float")],
+        desc="Set chain volume",
+    ),
+    _custom(
+        "/live/device/set/chain/mute",
+        "device",
+        kind="set",
+        params=[_track, _device, _p("chain_id", "int"), _p("muted", "bool")],
+        desc="Set chain mute state",
+    ),
 ]
 
 device_domain = DomainSpec(
     name="device",
-    description="Device properties, parameter batch/individual access, and parameter listeners",
+    description="Device properties, parameter access, parameter listeners, and rack chain operations",
     base_address="/live/device",
     index_params=[_track, _device],
     endpoints=(_bulk_props("device", _dev_props_ro, [], idx=_dev_idx) + _dev_custom),
@@ -1433,6 +1637,7 @@ spec = AbletonOSCSpec(
         song_domain,
         track_domain,
         clip_domain,
+        arrangement_clip_domain,
         clip_slot_domain,
         device_domain,
         scene_domain,

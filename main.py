@@ -5,12 +5,15 @@ Requires the remix-mcp fork of AbletonOSC installed as a Remote Script.
 This fork adds /live/browser/* endpoints for loading instruments and effects.
 """
 
+import os
 import socket
 import threading
 import time
 from pythonosc.osc_message_builder import OscMessageBuilder
 from pythonosc.osc_message import OscMessage
 from spec_data import spec as _ableton_spec
+
+import requests
 
 REMOTE_PORT = 11000
 LOCAL_PORT = 11001
@@ -206,11 +209,111 @@ class LiveAPI:
     def device(self, track_id, device_id):
         return self._indexed("device", track_id, device_id)
 
+    def arrangement_clip(self, track_id, clip_id):
+        return self._indexed("arrangement_clip", track_id, clip_id)
+
     def scene(self, scene_id):
         return self._indexed("scene", scene_id)
 
     def stop(self):
         self._osc.stop()
+
+
+# ---------------------------------------------------------------------------
+# Audio capture & analysis
+# ---------------------------------------------------------------------------
+
+ANALYZER_URL = os.environ.get(
+    "BERGAIN_ANALYZER_URL",
+    "https://bergain-aesthetics--analyzer-analyze.modal.run",
+)
+
+
+def capture_audio(api, start_time: float, duration: float) -> str:
+    """Capture audio from Ableton via the File Recorder M4L device.
+
+    Uses File Recorder (maxforlive.com/library/device/10536) in "Link
+    Start/Stop" mode: recording starts/stops automatically with transport.
+
+    Setup: place File Recorder on the track you want to capture (e.g. Master
+    routed to a utility track). Set env vars:
+      CAPTURE_TRACK   — track index where File Recorder lives (default 0)
+      CAPTURE_DEVICE  — device index on that track (default 0)
+      CAPTURE_DIR     — directory where File Recorder saves WAVs; defaults
+                        to the Ableton project folder. File Recorder writes
+                        files named "[TrackName]+[Timestamp].wav".
+
+    Orchestrates: snapshot dir → seek → play → wait → stop → find new file.
+    Returns the path to the captured WAV file.
+    """
+    import glob
+
+    capture_track = int(os.environ.get("CAPTURE_TRACK", "0"))
+    capture_device = int(os.environ.get("CAPTURE_DEVICE", "0"))
+    capture_dir = os.environ.get("CAPTURE_DIR", "")
+
+    if not capture_dir:
+        raise ValueError(
+            "CAPTURE_DIR must be set to the folder where File Recorder saves WAVs "
+            "(typically your Ableton project folder)"
+        )
+
+    # Snapshot existing WAVs so we can detect the new one
+    existing = set(glob.glob(os.path.join(capture_dir, "*.wav")))
+
+    # Ensure "Link Start/Stop" is ON (File Recorder param index 1)
+    # Param 0 = Rec toggle, Param 1 = Link Start/Stop
+    api._osc.send(
+        "/live/device/set/parameter/value", [capture_track, capture_device, 1, 1.0]
+    )
+    time.sleep(0.1)
+
+    # Seek to start position
+    api.song.set("current_song_time", start_time)
+    time.sleep(0.1)
+
+    # Start playback — File Recorder auto-starts recording
+    api.song.call("start_playing")
+
+    # Wait for the capture duration
+    time.sleep(duration + 0.5)
+
+    # Stop playback — File Recorder auto-stops and writes the WAV
+    api.song.call("stop_playing")
+    time.sleep(1.0)  # give it a moment to flush to disk
+
+    # Find the new WAV file
+    current = set(glob.glob(os.path.join(capture_dir, "*.wav")))
+    new_files = current - existing
+
+    if not new_files:
+        raise FileNotFoundError(
+            f"No new WAV file appeared in {capture_dir} after capture. "
+            "Check that File Recorder is on the correct track/device and "
+            "CAPTURE_DIR points to its output folder."
+        )
+
+    # Return the most recently modified new file
+    return max(new_files, key=os.path.getmtime)
+
+
+def analyze_audio(
+    file_path: str,
+    analysis_type: str,
+    bpm: float | None = None,
+    file_path_2: str | None = None,
+) -> dict:
+    """Send audio to the Modal Analyzer endpoint and return results."""
+    files = {"file": ("audio.wav", open(file_path, "rb"), "audio/wav")}
+    data = {"analysis_type": analysis_type}
+    if bpm is not None:
+        data["bpm"] = str(bpm)
+    if file_path_2:
+        files["file2"] = ("audio2.wav", open(file_path_2, "rb"), "audio/wav")
+
+    resp = requests.post(ANALYZER_URL, files=files, data=data, timeout=120)
+    resp.raise_for_status()
+    return resp.json()
 
 
 # ---------------------------------------------------------------------------
@@ -499,100 +602,393 @@ def load_effect(api, track, name):
 # ---------------------------------------------------------------------------
 
 
-def main():
-    api = LiveAPI()
-    bars = 4
-    beats = bars * 4
-    bpm = 124
+def setup_tracks(api, track_specs):
+    """Create fresh MIDI tracks for each spec, removing all existing tracks.
 
-    # --- Global setup ---
-    print("Setting up session...")
+    track_specs: list of (name, instrument_loader) tuples.
+    Returns the number of tracks set up.
+    """
+    # Create the new MIDI tracks first (can't delete all — need at least one)
+    for i in range(len(track_specs)):
+        api._osc.send("/live/song/create_midi_track", [0])
+        time.sleep(0.3)
+
+    # Delete the old tracks (now pushed to the end)
+    num_tracks = api.song.get("num_tracks")
+    while num_tracks > len(track_specs):
+        api._osc.send("/live/song/delete_track", [num_tracks - 1])
+        time.sleep(0.3)
+        num_tracks = api.song.get("num_tracks")
+
+    # Name and load instruments
+    for t, (name, loader) in enumerate(track_specs):
+        api.track(t).set("name", name)
+        if loader:
+            loader(api, t)
+
+    return len(track_specs)
+
+
+def create_arrangement_clip_with_notes(api, track, start, length, notes, name):
+    """Create arrangement clip, populate with notes, name it. Returns clip index."""
+    result = api._osc.query(
+        "/live/track/create_arrangement_clip",
+        [track, float(start), float(length)],
+        timeout=3.0,
+    )
+    clip_idx = result[1]
+    time.sleep(0.15)
+    if notes:
+        api._osc.send("/live/arrangement_clip/add/notes", [track, clip_idx] + notes)
+    api.arrangement_clip(track, clip_idx).set("name", name)
+    time.sleep(0.1)
+    return clip_idx
+
+
+def clear_arrangement(api, num_tracks):
+    """Delete all arrangement clips from all tracks."""
+    for t in range(num_tracks):
+        for _ in range(50):
+            try:
+                api._osc.send("/live/track/delete_arrangement_clip", [t, 0])
+                time.sleep(0.1)
+            except Exception:
+                break
+
+
+def print_arrangement(api, num_tracks):
+    """Print the full arrangement layout."""
+    print("\n  Arrangement layout:")
+    for t in range(num_tracks):
+        try:
+            names = api._osc.query("/live/track/get/arrangement_clips/name", [t])
+            times = api._osc.query("/live/track/get/arrangement_clips/start_time", [t])
+            clip_names = list(names[1:]) if len(names) > 1 else []
+            clip_times = list(times[1:]) if len(times) > 1 else []
+            track_name = api.track(t).get("name")
+            for cn, ct in zip(clip_names, clip_times):
+                bar = int(ct) // 4 + 1
+                print(f"    {track_name:8s} | bar {bar:3d} | '{cn}'")
+        except TimeoutError:
+            pass
+
+
+def demo_full(api):
+    """Build and play a complete 5-section song demonstrating the full API.
+
+    Demonstrates:
+      - Song control (tempo, groove, metronome)
+      - Track creation and deletion
+      - Instrument & effect loading via browser
+      - Mix (volumes, panning)
+      - Arrangement clip creation with MIDI notes
+      - Clip duplication, splitting, and moving
+      - Rack/chain queries (Drum Rack)
+      - Session clip creation (scene triggers)
+      - Playback
+    """
+    BPM = 124
+    BARS_PER_SECTION = 4
+    BEATS = BARS_PER_SECTION * 4  # 16 beats per section
+
+    # ── Song setup ──────────────────────────────────────────────────────
+    print("1. Song setup")
     api.song.call("stop_playing")
     time.sleep(0.2)
-    api.song.set("tempo", float(bpm))
+    api.song.set("tempo", float(BPM))
     api.song.set("groove_amount", 0.25)
     api.song.set("metronome", False)
+    print(f"   Tempo: {BPM} BPM, groove: 0.25")
 
-    # --- Load instruments (expects 4 MIDI tracks) ---
-    print("\nLoading instruments...")
-    load_drum_kit(api, track=0)
-    load_instrument(api, track=1, name="Drift")
-    load_instrument(api, track=2, name="Drift")
-    load_instrument(api, track=3, name="Drift")
+    # ── Track setup ─────────────────────────────────────────────────────
+    print("\n2. Track setup")
+    n_tracks = setup_tracks(
+        api,
+        [
+            ("Drums", lambda a, t: load_drum_kit(a, t)),
+            ("Bass", lambda a, t: load_instrument(a, t, "Drift")),
+            ("Pad", lambda a, t: load_instrument(a, t, "Drift")),
+            ("Lead", lambda a, t: load_instrument(a, t, "Drift")),
+        ],
+    )
 
-    # Name tracks
-    api.track(0).set("name", "Drums")
-    api.track(1).set("name", "Bass")
-    api.track(2).set("name", "Pad")
-    api.track(3).set("name", "Lead")
-
-    # --- Effects ---
-    print("\nLoading effects...")
+    # ── Effects ─────────────────────────────────────────────────────────
+    print("\n3. Effects")
     load_effect(api, track=2, name="Reverb")
     load_effect(api, track=3, name="Delay")
 
-    # --- Mix ---
-    api.track(0).set("volume", 0.85)
-    api.track(1).set("volume", 0.80)
-    api.track(2).set("volume", 0.65)
-    api.track(3).set("volume", 0.70)
-    api.track(2).set("panning", -0.15)
-    api.track(3).set("panning", 0.15)
+    # ── Mix ─────────────────────────────────────────────────────────────
+    print("\n4. Mix")
+    mix = [(0, 0.85, 0.0), (1, 0.80, 0.0), (2, 0.65, -0.15), (3, 0.70, 0.15)]
+    for t, vol, pan in mix:
+        api.track(t).set("volume", vol)
+        api.track(t).set("panning", pan)
+        name = api.track(t).get("name")
+        print(f"   {name}: vol={vol}, pan={pan}")
 
-    # --- Create clips across 5 scenes ---
-    print(f"\nCreating {bars}-bar clips across 5 scenes...")
+    # ── Chain queries ───────────────────────────────────────────────────
+    print("\n5. Rack/chain inspection")
+    try:
+        result = api._osc.query("/live/device/get/num_chains", [0, 0], timeout=1.5)
+        n_chains = result[2]
+        dev_name = api.device(0, 0).get("name")
+        print(f"   Drums > {dev_name}: {n_chains} chains")
+        names = api._osc.query("/live/device/get/chains/name", [0, 0])
+        for i, cn in enumerate(list(names[2:])[:8]):
+            print(f"     [{i:2d}] {cn}")
+        if n_chains > 8:
+            print(f"     ... and {n_chains - 8} more")
+    except (TimeoutError, Exception) as e:
+        print(f"   No rack chains found: {e}")
 
-    # Scene 0: Intro — hats + pad only
-    create_clip(api, 0, 0, beats, make_intro_drums(bars), "Intro Drums")
-    create_clip(api, 2, 0, beats, make_pad_sustained(bars), "Intro Pad")
+    # ── Arrangement ─────────────────────────────────────────────────────
+    print("\n6. Building arrangement")
+    clear_arrangement(api, n_tracks)
 
-    # Scene 1: Build — full drums + bass enters + pad
-    create_clip(api, 0, 1, beats, make_build_drums(bars), "Build Drums")
-    create_clip(api, 1, 1, beats, make_build_bass(bars), "Build Bass")
-    create_clip(api, 2, 1, beats, make_pad_sustained(bars), "Build Pad")
+    # Section layout: Intro(8) → Build(8) → Drop(16) → Breakdown(8) → Finale(16)
+    # All times in beats. Each "bars" unit = BARS_PER_SECTION = 4 bars = 16 beats.
+    sections = [
+        # (name, start_beat, n_bars, drums_fn, bass_fn, pad_fn, lead_fn)
+        ("Intro", 0, 8, make_intro_drums, None, make_pad_sustained, None),
+        ("Build", 32, 8, make_build_drums, make_build_bass, make_pad_sustained, None),
+        (
+            "Drop",
+            64,
+            8,
+            lambda b: make_kick(b) + make_hihat(b) + make_clap(b),
+            make_drop_bass,
+            make_pad_rhythmic,
+            make_lead,
+        ),
+        (
+            "Breakdown",
+            96,
+            8,
+            make_breakdown_drums,
+            make_breakdown_bass,
+            make_pad_sustained,
+            None,
+        ),
+        (
+            "Finale",
+            128,
+            8,
+            lambda b: make_kick(b) + make_hihat(b) + make_clap(b),
+            make_finale_bass,
+            make_pad_rhythmic,
+            make_lead,
+        ),
+    ]
 
-    # Scene 2: Drop — everything, rhythmic stabs, lead enters
-    drop_drums = make_kick(bars) + make_hihat(bars) + make_clap(bars)
-    create_clip(api, 0, 2, beats, drop_drums, "Drop Drums")
-    create_clip(api, 1, 2, beats, make_drop_bass(bars), "Drop Bass")
-    create_clip(api, 2, 2, beats, make_pad_rhythmic(bars), "Drop Pad")
-    create_clip(api, 3, 2, beats, make_lead(bars), "Lead")
+    for sec_name, start_beat, n_bars, drum_fn, bass_fn, pad_fn, lead_fn in sections:
+        beats = n_bars * 4
+        print(f"   {sec_name} @ bar {start_beat // 4 + 1} ({n_bars} bars)")
+        fns = [drum_fn, bass_fn, pad_fn, lead_fn]
+        track_names = ["Drums", "Bass", "Pad", "Lead"]
+        for t, (fn, tname) in enumerate(zip(fns, track_names)):
+            if fn is None:
+                continue
+            notes = fn(n_bars)
+            clip_name = f"{sec_name} {tname}"
+            create_arrangement_clip_with_notes(
+                api, t, start_beat, beats, notes, clip_name
+            )
 
-    # Scene 3: Breakdown — sparse drums, walking bass, sustained pad
-    create_clip(api, 0, 3, beats, make_breakdown_drums(bars), "Break Drums")
-    create_clip(api, 1, 3, beats, make_breakdown_bass(bars), "Break Bass")
-    create_clip(api, 2, 3, beats, make_pad_sustained(bars), "Break Pad")
+    # ── Demonstrate split, duplicate, move ──────────────────────────────
+    print("\n7. Arrangement operations")
 
-    # Scene 4: Finale — full energy, driving bass, lead returns
-    create_clip(api, 0, 4, beats, drop_drums, "Finale Drums")
-    create_clip(api, 1, 4, beats, make_finale_bass(bars), "Finale Bass")
-    create_clip(api, 2, 4, beats, make_pad_rhythmic(bars), "Finale Pad")
-    create_clip(api, 3, 4, beats, make_lead(bars), "Finale Lead")
+    # Duplicate the Drop drums (index varies, find by name)
+    drop_drums_start = 64.0
+    finale_end = 128.0 + 8 * 4  # 160
+    print(f"   Duplicating Drop Drums to beat {finale_end} (outro)...")
+    # Find the Drop Drums clip index
+    times = api._osc.query("/live/track/get/arrangement_clips/start_time", [0])
+    drop_idx = None
+    for i, st in enumerate(times[1:]):
+        if abs(st - drop_drums_start) < 0.01:
+            drop_idx = i
+            break
+    if drop_idx is not None:
+        result = api._osc.query(
+            "/live/track/duplicate_arrangement_clip",
+            [0, drop_idx, finale_end],
+            timeout=3.0,
+        )
+        print(f"     Created outro drums at clip {result[1]}")
 
-    # Name scenes
+    # Split the Finale bass at the midpoint for a breakdown effect
+    finale_bass_start = 128.0
+    split_point = finale_bass_start + 16.0  # split 4 bars in
+    print(f"   Splitting Finale Bass at beat {split_point}...")
+    times = api._osc.query("/live/track/get/arrangement_clips/start_time", [1])
+    finale_bass_idx = None
+    for i, st in enumerate(times[1:]):
+        if abs(st - finale_bass_start) < 0.01:
+            finale_bass_idx = i
+            break
+    if finale_bass_idx is not None:
+        result = api._osc.query(
+            "/live/track/split_arrangement_clip",
+            [1, finale_bass_idx, split_point],
+            timeout=3.0,
+        )
+        print(f"     Split into clips {result[1]} and {result[2]}")
+        # Move the second half later to create a 2-bar gap
+        gap_dest = split_point + 8.0
+        print(f"   Moving second half to beat {gap_dest} (2-bar gap)...")
+        result = api._osc.query(
+            "/live/track/move_arrangement_clip", [1, result[2], gap_dest], timeout=3.0
+        )
+        print(f"     Moved to clip {result[1]}")
+
+    print_arrangement(api, n_tracks)
+
+    # ── Session clips (for live triggering) ─────────────────────────────
+    print("\n8. Session clips")
     scene_names = ["Intro", "Build", "Drop", "Breakdown", "Finale"]
-    for i, name in enumerate(scene_names):
-        api.scene(i).set("name", name)
+    scene_patterns = [
+        # (drums, bass, pad, lead) — fn or None
+        (make_intro_drums, None, make_pad_sustained, None),
+        (make_build_drums, make_build_bass, make_pad_sustained, None),
+        (
+            lambda b: make_kick(b) + make_hihat(b) + make_clap(b),
+            make_drop_bass,
+            make_pad_rhythmic,
+            make_lead,
+        ),
+        (make_breakdown_drums, make_breakdown_bass, make_pad_sustained, None),
+        (
+            lambda b: make_kick(b) + make_hihat(b) + make_clap(b),
+            make_finale_bass,
+            make_pad_rhythmic,
+            make_lead,
+        ),
+    ]
+    for scene_idx, (name, fns) in enumerate(zip(scene_names, scene_patterns)):
+        for t, fn in enumerate(fns):
+            if fn is not None:
+                create_clip(
+                    api,
+                    t,
+                    scene_idx,
+                    BEATS,
+                    fn(BARS_PER_SECTION),
+                    f"{name} {['Drums', 'Bass', 'Pad', 'Lead'][t]}",
+                )
+        api.scene(scene_idx).set("name", name)
 
-    # --- Play through the set ---
-    print("\nStarting set...")
+    # ── Song info ───────────────────────────────────────────────────────
+    print("\n9. Song summary")
+    print(f"   Tempo:  {api.song.get('tempo')} BPM")
+    print(f"   Tracks: {api.song.get('num_tracks')}")
+    print(f"   Scenes: {api.song.get('num_scenes')}")
+    sig_num = api.song.get("signature_numerator")
+    sig_den = api.song.get("signature_denominator")
+    print(f"   Time:   {sig_num}/{sig_den}")
+
+    # ── Playback ────────────────────────────────────────────────────────
+    print("\n10. Playing arrangement...")
+    api.song.set("current_song_time", 0.0)
+    time.sleep(0.1)
     api.song.call("start_playing")
+    bar_duration = 4 * 60.0 / BPM
 
-    scene_bars = [4, 4, 8, 4, 8]  # how long to hold each scene
-    bar_duration = 4 * 60.0 / bpm
+    section_bars = [8, 8, 8, 8, 8, 8]  # +8 for outro
+    section_names = ["Intro", "Build", "Drop", "Breakdown", "Finale", "Outro"]
 
     try:
-        for i, (name, nbars) in enumerate(zip(scene_names, scene_bars)):
-            print(f"  >>> {name} ({nbars} bars)")
-            api.scene(i).call("fire")
+        for name, nbars in zip(section_names, section_bars):
+            print(f"    >>> {name} ({nbars} bars)")
             time.sleep(nbars * bar_duration)
-
-        print("\nSet complete — looping finale. Press Ctrl+C to stop.")
-        while True:
-            time.sleep(1)
     except KeyboardInterrupt:
-        print("\nStopping...")
-        api.song.call("stop_playing")
+        pass
+    api.song.call("stop_playing")
+    print("\n   Done.")
+
+    return BPM
+
+
+def main():
+    import sys
+
+    commands = {
+        "info": "Show current song state",
+        "demo": "Build and play a full 5-section song (instruments, arrangement, chains, mix)",
+        "capture": "Capture audio and run analysis (requires File Recorder M4L + Modal)",
+    }
+
+    if len(sys.argv) < 2 or sys.argv[1] not in commands:
+        print("bergain — Ableton Live control via AbletonOSC\n")
+        print("Usage: uv run python main.py <command>\n")
+        print("Commands:")
+        for cmd, desc in commands.items():
+            print(f"  {cmd:10s} {desc}")
+        n_eps = sum(len(d.endpoints) for d in _ableton_spec.domains)
+        n_doms = len(_ableton_spec.domains)
+        print(f"\n{n_doms} domains, {n_eps} endpoints")
+        return
+
+    cmd = sys.argv[1]
+    api = LiveAPI()
+
+    if cmd == "info":
+        print("--- Song Info ---")
+        print(f"  Tempo:    {api.song.get('tempo')} BPM")
+        print(f"  Tracks:   {api.song.get('num_tracks')}")
+        print(f"  Scenes:   {api.song.get('num_scenes')}")
+        sig_num = api.song.get("signature_numerator")
+        sig_den = api.song.get("signature_denominator")
+        print(f"  Time sig: {sig_num}/{sig_den}")
+        num_tracks = api.song.get("num_tracks")
+        print("\n  Tracks:")
+        for t in range(num_tracks):
+            name = api.track(t).get("name")
+            devs = api.track(t).get("num_devices")
+            midi = api.track(t).get("has_midi_input")
+            print(f"    [{t}] {name} ({'MIDI' if midi else 'Audio'}, {devs} devices)")
+        print("\n  Arrangement:")
+        has_clips = False
+        for t in range(num_tracks):
+            try:
+                names = api._osc.query("/live/track/get/arrangement_clips/name", [t])
+                times = api._osc.query(
+                    "/live/track/get/arrangement_clips/start_time", [t]
+                )
+                clip_names = list(names[1:]) if len(names) > 1 else []
+                clip_times = list(times[1:]) if len(times) > 1 else []
+                track_name = api.track(t).get("name")
+                for cn, ct in zip(clip_names, clip_times):
+                    bar = int(ct) // 4 + 1
+                    print(f"    {track_name:8s} | bar {bar:3d} | '{cn}'")
+                    has_clips = True
+            except TimeoutError:
+                pass
+        if not has_clips:
+            print("    (empty)")
+
+    elif cmd == "demo":
+        demo_full(api)
+
+    elif cmd == "capture":
+        capture_dir = os.environ.get("CAPTURE_DIR", "")
+        if not capture_dir:
+            print("Set CAPTURE_DIR to the folder where File Recorder saves WAVs.")
+            print("Requires File Recorder M4L device on a track.")
+        else:
+            bpm = float(api.song.get("tempo"))
+            duration = 4 * 4 * 60.0 / bpm
+            print(f"Capturing {duration:.1f}s of audio...")
+            wav_path = capture_audio(api, start_time=0.0, duration=duration)
+            print(f"Captured: {wav_path}")
+            for analysis in ["key", "energy"]:
+                print(f"\nAnalyzing {analysis}...")
+                result = analyze_audio(wav_path, analysis, bpm=bpm)
+                if analysis == "key":
+                    print(
+                        f"  {result['key']} {result['scale']} (confidence: {result['confidence']:.2f})"
+                    )
+                elif analysis == "energy":
+                    print(f"  {len(result['frames'])} frames at {result['bpm']} BPM")
 
     api.stop()
 
