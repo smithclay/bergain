@@ -638,7 +638,7 @@ s = Set(
             volume=0.50,
             pan=0.20,
         ),
-        Track("Cello", sound="Cello Strings.adv", volume=0.40),
+        Track("Cello", sound="Ensemble Strings.adv", volume=0.40),
     ],
 )
 
