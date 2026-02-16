@@ -5,14 +5,7 @@ Four tracks become three become two become one.
 The fog swallows everything.
 """
 
-from main import (
-    Set,
-    Track,
-    Scene,
-    get_device_params,
-    find_param_index,
-    set_device_param,
-)
+from session import Set, Track, Scene, make_automation
 
 BPM = 55
 
@@ -67,7 +60,7 @@ def dusk_fog(bars):
         (63, 296.0, 12.0, 24),  # Eb4 — dissolving into section 2
     ]
     for pitch, start, dur, vel in melody_a + melody_b + melody_c + melody_d:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     # Ghost notes: octave below, very quiet, like tape bleed
     ghosts = [
         (51, 2.0, 4.0, 18),  # Eb3
@@ -79,7 +72,7 @@ def dusk_fog(bars):
         (56, 98.0, 4.0, 18),  # Ab3
     ]
     for pitch, start, dur, vel in ghosts:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -92,7 +85,7 @@ def wool_fog(bars):
     for i, (chord, vel) in enumerate(zip(progression, vels)):
         start = float(i * 64)
         for p in chord:
-            notes.extend([p, start, 62.0, vel, 0])
+            notes.append((p, start, 62.0, vel))
     return notes
 
 
@@ -111,7 +104,7 @@ def glass_fog(bars):
         (75, 296.0, 16.0, 18),  # Eb5 — barely there
     ]
     for pitch, start, dur, vel in tones:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -124,7 +117,7 @@ def deep_fog(bars):
         (39, 260.0, 56.0, 35),  # Eb2 — bars 66-80, fading
     ]
     for pitch, start, dur, vel in subs:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -150,7 +143,7 @@ def dusk_halos(bars):
         (56, 288.0, 12.0, 18),  # Ab3 — ghostly
     ]
     for pitch, start, dur, vel in phrases:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -168,7 +161,7 @@ def wool_halos(bars):
     vels = [42, 40, 38, 40, 34]
     for (chord, start), vel in zip(progression, vels):
         for p in chord:
-            notes.extend([p, start, 60.0, vel, 0])
+            notes.append((p, start, 60.0, vel))
     return notes
 
 
@@ -182,7 +175,7 @@ def glass_halos(bars):
         (75, 240.0, 16.0, 14),  # Eb5 — barely audible
     ]
     for pitch, start, dur, vel in tones:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -194,7 +187,7 @@ def deep_halos(bars):
         (24, 160.0, 120.0, 32),  # C1  — deeper
     ]
     for pitch, start, dur, vel in subs:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -217,7 +210,7 @@ def dusk_richmond(bars):
         (51, 312.0, 14.0, 12),  # Eb3 — last piano-ish note
     ]
     for pitch, start, dur, vel in fragments:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -234,7 +227,7 @@ def wool_richmond(bars):
     vels = [36, 34, 32, 30]
     for (chord, start), vel in zip(progression, vels):
         for p in chord:
-            notes.extend([p, start, 84.0, vel, 0])
+            notes.append((p, start, 84.0, vel))
     return notes
 
 
@@ -247,7 +240,7 @@ def glass_richmond(bars):
         (72, 180.0, 16.0, 10),  # C5 — last glass note, barely a whisper
     ]
     for pitch, start, dur, vel in tones:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -273,7 +266,7 @@ def dusk_lastbus(bars):
         (51, 140.0, 8.0, 14),  # Eb3 — last piano note, fading
     ]
     for pitch, start, dur, vel in walking:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     # Bars 36-80: silence. The bus has gone.
     return notes
 
@@ -290,7 +283,7 @@ def wool_lastbus(bars):
     vels = [34, 32, 30, 28]
     for (chord, start), vel in zip(progression, vels):
         for p in chord:
-            notes.extend([p, start, 76.0, vel, 0])
+            notes.append((p, start, 76.0, vel))
     return notes
 
 
@@ -303,7 +296,7 @@ def deep_lastbus(bars):
         (36, 180.0, 130.0, 25),  # C2  — settling
     ]
     for pitch, start, dur, vel in subs:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -327,14 +320,14 @@ def wool_radiator(bars):
     vels = [28, 26, 24, 22]
     for (chord, start), vel in zip(progression, vels):
         for p in chord:
-            notes.extend([p, start, 92.0, vel, 0])
+            notes.append((p, start, 92.0, vel))
     return notes
 
 
 def deep_radiator(bars):
     """Sub: single Eb drone for the entire section.
     The frequency of contentment."""
-    return [39, 0.0, float(bars * 4 - 4), 25, 0]
+    return [(39, 0.0, float(bars * 4 - 4), 25)]
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +349,7 @@ def wool_3am(bars):
         (46, 288.0, 32.0, 10),  # Bb2 — 8 bars, starts bar 72
     ]
     for pitch, start, dur, vel in tones:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -368,7 +361,7 @@ def deep_3am(bars):
         (27, 224.0, 140.0, 10),  # Eb1 — even quieter
     ]
     for pitch, start, dur, vel in subs:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -390,7 +383,7 @@ def wool_gone(bars):
         (39, 336.0, 32.0, 3),  # Eb2 — you imagined this
     ]
     for pitch, start, dur, vel in final:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -464,52 +457,23 @@ sections = [
 def main():
     s.setup()
 
-    # Discover device params
-    dusk_reverb_params = get_device_params(s.api, 0, 1)
-    wool_reverb_params = get_device_params(s.api, 1, 1)
-    dusk_decay = find_param_index(dusk_reverb_params, "decay")
-    wool_decay = find_param_index(wool_reverb_params, "decay")
+    s.session.param("Dusk", 1, "decay", 0.5)
+    print("    Dusk/Reverb Decay -> 0.5 (warm fog)")
 
-    if dusk_decay is not None:
-        set_device_param(s.api, 0, 1, dusk_decay, 0.5)
-        print("    Dusk/Reverb Decay -> 0.5 (warm fog)")
-
-    # Per-section param automation via on_enter
-    def make_auto(changes):
-        def on_enter(api):
-            for track, device, idx, val, desc in changes:
-                set_device_param(api, track, device, idx, val)
-                print(f"      [{desc}]")
-
-        return on_enter
-
-    auto = {}
-    if dusk_decay is not None:
-        auto.setdefault(1, []).append(
-            (0, 1, dusk_decay, 0.6, "Dusk/Reverb -> 0.6 (deeper fog)")
-        )
-        auto.setdefault(2, []).append(
-            (0, 1, dusk_decay, 0.75, "Dusk/Reverb -> 0.75 (heavy fog)")
-        )
-        auto.setdefault(3, []).append(
-            (0, 1, dusk_decay, 0.9, "Dusk/Reverb -> 0.9 (dissolving)")
-        )
-    if wool_decay is not None:
-        auto.setdefault(2, []).append(
-            (1, 1, wool_decay, 0.5, "Wool/Reverb -> 0.5 (bed deepens)")
-        )
-        auto.setdefault(4, []).append(
-            (1, 1, wool_decay, 0.65, "Wool/Reverb -> 0.65 (radiator warmth)")
-        )
-        auto.setdefault(5, []).append(
-            (1, 1, wool_decay, 0.8, "Wool/Reverb -> 0.8 (3am distance)")
-        )
-        auto.setdefault(6, []).append(
-            (1, 1, wool_decay, 0.95, "Wool/Reverb -> 0.95 (maximum fog)")
-        )
+    auto = {
+        1: [("Dusk", 1, "decay", 0.6, "Dusk/Reverb -> 0.6 (deeper fog)")],
+        2: [
+            ("Dusk", 1, "decay", 0.75, "Dusk/Reverb -> 0.75 (heavy fog)"),
+            ("Wool", 1, "decay", 0.5, "Wool/Reverb -> 0.5 (bed deepens)"),
+        ],
+        3: [("Dusk", 1, "decay", 0.9, "Dusk/Reverb -> 0.9 (dissolving)")],
+        4: [("Wool", 1, "decay", 0.65, "Wool/Reverb -> 0.65 (radiator warmth)")],
+        5: [("Wool", 1, "decay", 0.8, "Wool/Reverb -> 0.8 (3am distance)")],
+        6: [("Wool", 1, "decay", 0.95, "Wool/Reverb -> 0.95 (maximum fog)")],
+    }
 
     for sec_idx, changes in auto.items():
-        sections[sec_idx].on_enter = make_auto(changes)
+        sections[sec_idx].on_enter = make_automation(changes)
 
     s.load_scenes(sections)
     s.build_arrangement(sections)

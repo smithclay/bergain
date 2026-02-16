@@ -5,14 +5,7 @@ precision, and melancholy. Harpsichord, pizzicato strings,
 glockenspiel, and cello. Alexandre Desplat at the front desk.
 """
 
-from main import (
-    Set,
-    Track,
-    Scene,
-    get_device_params,
-    find_param_index,
-    set_device_param,
-)
+from session import Set, Track, Scene
 
 BPM = 150
 M = 3  # beats per waltz measure
@@ -117,10 +110,10 @@ def waltz_pizz(progression, root_vel=90, chord_vel=70):
     for i, name in enumerate(progression):
         root, tones = CHORDS[name]
         b = float(i * M)
-        notes.extend([root, b, 0.4, root_vel, 0])
+        notes.append((root, b, 0.4, root_vel))
         for p in tones:
-            notes.extend([p, b + 1, 0.3, chord_vel, 0])
-            notes.extend([p, b + 2, 0.3, chord_vel - 5, 0])
+            notes.append((p, b + 1, 0.3, chord_vel))
+            notes.append((p, b + 2, 0.3, chord_vel - 5))
     return notes
 
 
@@ -130,7 +123,7 @@ def waltz_cello(progression, vel=75):
     for i in range(0, len(progression), 2):
         root, _ = CHORDS[progression[i]]
         b = float(i * M)
-        notes.extend([root, b, float(M * 2 - 0.5), vel, 0])
+        notes.append((root, b, float(M * 2 - 0.5), vel))
     return notes
 
 
@@ -186,7 +179,7 @@ def keys_lobby(measures):
         (67, 45.0, 2.5, 88),  # G4 — home
     ]
     for pitch, start, dur, vel in theme_a + theme_a2:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -265,7 +258,7 @@ def keys_promenade(measures):
         (74, 69.0, 2.5, 92),
     ]
     for pitch, start, dur, vel in p1 + p2 + p3:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -291,7 +284,7 @@ def bells_promenade(measures):
         (86, 69.0, 0.8, 62),  # D6
     ]
     for pitch, start, dur, vel in accents:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -429,7 +422,7 @@ def keys_chase(measures):
         (67, 69.0, 2.5, 92),
     ]
     for pitch, start, dur, vel in p1 + p2 + p3:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -440,9 +433,9 @@ def strings_chase(measures):
         _, tones = CHORDS[name]
         b = float(i * M)
         if i > 0 and i % 4 == 0:
-            notes.extend([tones[0], b - 0.5, 0.2, 72, 0])
+            notes.append((tones[0], b - 0.5, 0.2, 72))
         if i % 2 == 0:
-            notes.extend([tones[1], b + 1.5, 0.2, 65, 0])
+            notes.append((tones[1], b + 1.5, 0.2, 65))
     return notes
 
 
@@ -493,7 +486,7 @@ def bells_chase(measures):
         (79, 69.0, 1.5, 70),
     ]
     for pitch, start, dur, vel in counter:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -503,7 +496,7 @@ def cello_chase(measures):
     for i, name in enumerate(CHASE_PROG):
         root, _ = CHORDS[name]
         b = float(i * M)
-        notes.extend([root, b, 2.5, 60, 0])
+        notes.append((root, b, 2.5, 60))
     return notes
 
 
@@ -562,7 +555,7 @@ def keys_reprise(measures):
         (67, 57.0, 2.5, 58),
     ]
     for pitch, start, dur, vel in theme + variation:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -581,7 +574,7 @@ def bells_reprise(measures):
         (79, 21.0, 0.8, 45),  # G5 — last bell
     ]
     for pitch, start, dur, vel in accents:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -621,7 +614,7 @@ def keys_curtain(measures):
         (74, 42.0, 5.0, 58),  # D5
     ]
     for pitch, start, dur, vel in final:
-        notes.extend([pitch, start, dur, vel, 0])
+        notes.append((pitch, start, dur, vel))
     return notes
 
 
@@ -693,18 +686,11 @@ sections = [
 def main():
     s.setup()
 
-    # Device params — reverb decay
-    keys_reverb_params = get_device_params(s.api, 0, 1)
-    keys_decay = find_param_index(keys_reverb_params, "decay")
-    if keys_decay is not None:
-        set_device_param(s.api, 0, 1, keys_decay, 0.2)
-        print("    Keys/Reverb Decay -> 0.2 (small room)")
+    s.session.param("Keys", 1, "decay", 0.2)
+    print("    Keys/Reverb Decay -> 0.2 (small room)")
 
-    bells_reverb_params = get_device_params(s.api, 2, 1)
-    bells_decay = find_param_index(bells_reverb_params, "decay")
-    if bells_decay is not None:
-        set_device_param(s.api, 2, 1, bells_decay, 0.25)
-        print("    Bells/Reverb Decay -> 0.25 (sparkle)")
+    s.session.param("Bells", 1, "decay", 0.25)
+    print("    Bells/Reverb Decay -> 0.25 (sparkle)")
 
     s.load_scenes(sections)
     s.build_arrangement(sections)
