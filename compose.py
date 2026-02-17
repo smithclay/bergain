@@ -15,6 +15,7 @@ Usage:
 import argparse
 import json
 import os
+import random
 import re
 import time
 
@@ -24,126 +25,133 @@ from session import Session, Track
 
 load_dotenv()
 
-# ---------------------------------------------------------------------------
-# Composition guide — injected as the `guide` input to the RLM.
-# Keep under ~1500 tokens. Reference data only, no code templates.
-# ---------------------------------------------------------------------------
-
-GUIDE = """\
-GOAL
-  You are composing music in a live DAW. Your job is to CREATE CLIPS with real MIDI notes
-  using the tools provided. The report you SUBMIT should describe what you ACTUALLY BUILT —
-  tracks created, clips with note counts, tempo, sections. Do NOT just write a plan.
-  Every run must call: browse(), create_tracks(), create_clip() (or create_arrangement_clip()).
-
-CREATIVE DECISIONS
-  Use llm_query() for musical choices — don't hardcode them in Python.
-  Example:
-    chords = llm_query("Suggest an 8-bar chord progression in G minor for a melancholy waltz. Return as comma-separated chord symbols like Gm, Dm, Eb, ...")
-    Parse the response and use chord() tool to get MIDI pitches.
-  Good uses: chord progressions, melody contours, rhythmic patterns, dynamics per phrase, section plan.
-  Bad: hardcoding chord tones, melodies, or using flat velocity for every note.
-
-NOTE FORMAT: [pitch, start_beat, duration, velocity]
-  start_beat is RELATIVE TO CLIP START (always starts from 0 for each clip)
-  Velocity dynamics: pp=30, p=50, mp=65, mf=80, f=100, ff=120
-  Use note("G3"), chord("G","min",4), scale("G","minor",4) for pitch lookup.
-
-TOOL RETURNS
-  Most tools return JSON strings. Parse with json.loads() before indexing.
-  Exceptions — plain text (do NOT json.loads):
-    browse() returns names one per line — use .split('\\n').
-    get_status() returns human-readable text — just print or read directly.
-  Complex inputs (create_tracks, create_clip, set_mix) accept JSON strings via json.dumps().
-  Check for "error" key in parsed JSON: if "error" in json.loads(result): handle it.
-
-VALUE RANGES
-  volume: 0.0 to 1.0 (0.85 = default, 0.0 = silent, 1.0 = max)
-  pan: -1.0 (left) to 1.0 (right), 0.0 = center
-
-SUBMIT RULES
-  SUBMIT() ends execution IMMEDIATELY — all print output in the same step is lost.
-  NEVER call SUBMIT() in the same code block as tool calls.
-  Before SUBMIT, call ready_to_submit(). If it says NOT READY, complete the missing steps first.
-  Only SUBMIT after ready_to_submit() returns READY.
-  The report must summarize what you CREATED: tracks, clips, note counts, tempo, sections.
-
-CLIPS
-  create_clip(track, slot, length, notes) — session view. slot = section index (0, 1, 2, ...).
-    Best for: loopable sections, jamming, reusable parts. Each clip is independent.
-  create_arrangement_clip(track, start_beat, length, notes) — arrangement view.
-    Best for: linear pieces with a fixed timeline (intro→verse→chorus→outro).
-  Default to session clips. If you need a fixed timeline (e.g. A-B-A-B-Coda), use arrangement clips.
-
-EXAMPLE — each "Step N" is a SEPARATE code execution (do NOT combine into one block):
-  Step 1 — Browse & pick instruments:
-    results = browse("strings", "Sounds")
-    print(results)                          # print ALL results, pick best in next step
-  Step 2 — Choose instruments with llm_query:
-    choice = llm_query("Pick the best instruments from these browser results for a melancholy
-      waltz. Available: " + results + ". I need: harpsichord, solo violin, viola, cello.
-      Return one name per line, exactly matching a browser result.")
-    # parse choice, then create_tracks with those sound names
-  Step 3 — Setup:
-    create_tracks(json.dumps([{"name":"Harpsichord","sound":"Harpsichord"}, ...]))
-    set_tempo(72)
-    print(get_status())                     # verify devices loaded
-  Step 4 — Plan sections & harmony:
-    plan = llm_query("Plan 4 sections (intro 4bars, A 8bars, B 8bars, coda 4bars) for a
-      melancholy waltz in G minor. For each section give: chord symbols per bar, melody
-      contour description, dynamics (pp/p/mp/mf/f). Return as structured text.")
-  Step 5 — Section A clips (one section per step):
-    pitches = [json.loads(chord(root, qual, 4)) for root, qual in parsed_chords]
-    # build note arrays with VARIED velocity and proper durations (~30 lines), then:
-    create_clip("Harpsichord", 0, 24.0, json.dumps(harpsi_notes), "A")
-    create_clip("Violin", 0, 24.0, json.dumps(violin_notes), "A")
-    # ... one create_clip per track
-  Step 6 — Section B clips (same pattern)
-  Step 7 — Mix & verify:
-    set_mix(json.dumps({"Violin": {"volume": 0.85, "pan": -0.3}, ...}))
-    print(get_status())
-    print(ready_to_submit())                # must say READY before you SUBMIT
-  Step 8 — SUBMIT (no tool calls here, only after ready_to_submit said READY):
-    SUBMIT("Created 4 tracks, 12 clips across 3 sections...")
-
-  Why separate steps? Each step can fail. Small blocks = only redo ONE step, not everything.
-  Duration target: bars * beats_per_bar * 60 / tempo. Aim for 3-5 distinct sections.
-
-REALIZATION — how to turn chords into good note arrays
-  Durations (in beats) — match the instrument role:
-    Bass/cello: sustain the FULL BAR (e.g. 3.0 in 3/4, 4.0 in 4/4). Short bass = silence gaps.
-    Pads/strings: sustain full bar or tie across bars for legato.
-    Chords (harpsichord, piano): shorter hits (0.5–1.0) for rhythm, longer (2.0+) for ballads.
-    Melody: varied durations from llm_query. Mix quarters, eighths, dotted notes. Never all equal.
-  Velocity — MUST vary across phrases. Flat velocity = robotic.
-    Use llm_query: "Give velocity (40-110) for each of these 8 bars: gentle swell then fade"
-    Or compute: crescendo = [50 + i*8 for i in range(8)], decrescendo = reverse.
-    Emphasize beat 1 slightly (+10 vel) in waltz/dance styles.
-    Inner voices (viola, pad) quieter than melody (-15 to -20 vel).
-  Waltz accompaniment (harpsichord/piano): BOTH bass AND chord in the same track.
-    Beat 1: bass root (octave 2-3), duration 1.0, strong velocity
-    Beats 2-3: chord dyad/triad (octave 4-5), duration 0.9, softer velocity
-    This is ONE track with 7 notes/bar, not split across tracks.
-
-PATTERNS
-  Waltz: bass on 1 + chord on 2,3 (see REALIZATION above)
-  Arpeggio: cycle chord tones on subdivisions (8ths or 16ths)
-  Four-on-floor: [(kick, beat*4, 0.5, 100) for beat in range(bars*4)]
-  Drone/pedal: one note sustained for the entire section length
-  Ghost notes: same rhythm, velocity 25-40
-
-TIPS
-  - Aim for 3-5 DISTINCT sections (intro/A/B/A'/coda). Two sections on repeat is monotonous.
-  - set_mix() after clips to pan and balance: strings spread L/R, bass center.
-  - Instrument selection: browse() returns many results. Print them ALL, then use llm_query()
-    to pick the best match for your piece. Don't blindly take the first result.
-    If browse("viola") returns NO_RESULTS, try: "viola section", "string ensemble", "strings".
-  - get_status() returns plain text — just print it, don't json.loads().
-  - get_params() lists adjustable device parameters (device 0 = instrument, 1+ = effects).
-"""
 
 # ---------------------------------------------------------------------------
-# Tools — 22 closures over a Session instance.
+# DSPy Signature — the docstring IS the prompt (highest-priority position).
+# Tool-specific reference goes in tool docstrings, not here.
+# ---------------------------------------------------------------------------
+
+
+class Compose(dspy.Signature):
+    """You are composing music in a live DAW by writing Python code that calls
+    music tools. Describe the SHAPE of each section (energy, style, chords)
+    and write_section() renders the MIDI notes for you.
+
+    WORKFLOW — one phase per code step, never combine phases:
+      1. BROWSE & SETUP: browse() + create_tracks() + set_tempo() — all in ONE step.
+      2. PLAN: llm_query() for creative decisions — key, energy arc, chord progression
+         per section. Must cover FULL duration. Request JSON, parse with re.search.
+      3. COMPOSE: write_section() — ONE call per section, sequential on timeline.
+      4. MIX: set_mix() + get_status() + ready_to_submit()
+      5. SUBMIT: SUBMIT(report) alone.
+
+    RULES:
+      - Use llm_query() to decide key, chords, energy arc, and style names.
+      - write_section() handles all MIDI rendering — you never build note arrays.
+      - Each section needs DIFFERENT energy/style/chords — monotony is failure.
+      - ready_to_submit() checks milestones. Only SUBMIT after it says READY.
+      - Most tools return JSON (parse with json.loads). Exceptions: browse() and
+        get_status() return plain text.
+
+    EXAMPLE (each step = one code block, separate execution):
+      Step 1: browse("909", "Drums"); create_tracks(json.dumps([
+                {"name":"Drums","drum_kit":"909 Core Kit.adg"},
+                {"name":"Bass","instrument":"Operator"},
+                {"name":"Pad","sound":"Warm Pad"}])); set_tempo(130)
+      Step 2: plan = llm_query('Dark techno in F minor, 96 bars (3 min at 130).
+                Return JSON: {"key":"F","sections":[
+                  {"name":"Intro","bars":16,"energy":0.3,"chords":["Fm","Cm"],
+                   "drums":"minimal","bass":"sustained","pad":"atmospheric"},
+                  {"name":"Build","bars":16,"energy":0.6,
+                   "chords":["Fm","Cm7","Ab","Eb"],
+                   "drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"},
+                  ...]}')
+      Step 3: write_section(json.dumps({"name":"Intro","start_beat":0,"bars":16,
+                "energy":0.3,"key":"F","chords":["Fm","Cm"],
+                "drums":"minimal","bass":"sustained","pad":"atmospheric"}))
+      Step 4: write_section(json.dumps({"name":"Build","start_beat":64,"bars":16,
+                "energy":0.6,"key":"F","chords":["Fm","Cm7","Ab","Eb"],
+                "drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"}))
+      ...
+      Step N-1: set_mix(json.dumps({"Drums":0.9,"Bass":0.85,"Pad":0.7}));
+                print(get_status()); print(ready_to_submit())
+      Step N: SUBMIT(report)
+    """
+
+    brief: str = dspy.InputField(
+        description="Creative brief describing mood, genre, tempo, instrumentation, and duration"
+    )
+    report: str = dspy.OutputField(
+        description="Summary of what was BUILT in the DAW: tempo, tracks with loaded devices, "
+        "sections with bar ranges and clip names and note counts, mix levels, key and progression"
+    )
+
+
+class ComposeSession(dspy.Signature):
+    """You are building a live performance palette in a DAW by writing Python
+    code. Build a grid of looping clips organized by SCENE (energy level).
+    The human DJ fires scenes to perform the arrangement live.
+
+    WORKFLOW — one phase per code step, never combine phases:
+      1. BROWSE & SETUP: browse() + create_tracks() + set_tempo() — all in ONE step.
+      2. PLAN: llm_query() for creative decisions — key, scenes (energy levels),
+         chord progressions per scene, style choices. Plan 5-8 scenes spanning
+         the full energy arc (ambient → build → peak → breakdown → peak → outro).
+         Always request JSON. Parse: re.search(r'{.*}', response, re.S)
+      3. BUILD PALETTE: write_clip() — ONE call per scene. Each scene fills one
+         row of the session grid across all tracks. Clips loop automatically.
+         Use 4-bar loops (short, tight) or 8-bar loops (more variation).
+      4. MIX: set_mix() + get_status() + ready_to_submit()
+      5. SUBMIT: SUBMIT(report) alone.
+
+    RULES:
+      - Use llm_query() to decide key, chords, energy levels, and style names.
+      - write_clip() handles all MIDI rendering — you never build note arrays.
+      - Each scene needs DIFFERENT energy/style/chords — monotony is failure.
+      - Scenes are indexed 0, 1, 2... — lower slots = lower energy is natural
+        but not required. The DJ chooses fire order.
+      - ready_to_submit() checks milestones. Only SUBMIT after it says READY.
+      - Most tools return JSON (parse with json.loads). Exceptions: browse() and
+        get_status() return plain text.
+
+    EXAMPLE (each step = one code block, separate execution):
+      Step 1: browse("909", "Drums"); create_tracks(json.dumps([
+                {"name":"Drums","drum_kit":"909 Core Kit.adg"},
+                {"name":"Bass","instrument":"Operator"},
+                {"name":"Pad","sound":"Warm Pad"}])); set_tempo(130)
+      Step 2: plan = llm_query('Dark techno in F minor. Build 6 scenes for
+                live performance. Return JSON: {"key":"F","scenes":[
+                  {"name":"Ambient","slot":0,"bars":8,"energy":0.2,
+                   "chords":["Fm"],"drums":"minimal","bass":"none","pad":"atmospheric"},
+                  {"name":"Groove","slot":1,"bars":4,"energy":0.5,
+                   "chords":["Fm","Cm"],"drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"},
+                  {"name":"Drive","slot":2,"bars":4,"energy":0.7,...},
+                  {"name":"Peak","slot":3,"bars":4,"energy":0.95,...},
+                  {"name":"Breakdown","slot":4,"bars":8,"energy":0.3,...},
+                  {"name":"Outro","slot":5,"bars":8,"energy":0.15,...}]}')
+      Step 3: write_clip(json.dumps({"name":"Ambient","slot":0,"bars":8,
+                "energy":0.2,"key":"F","chords":["Fm"],
+                "drums":"minimal","bass":"none","pad":"atmospheric"}))
+      Step 4: write_clip(json.dumps({"name":"Groove","slot":1,"bars":4,
+                "energy":0.5,"key":"F","chords":["Fm","Cm"],
+                "drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"}))
+      ...
+      Step N-1: set_mix(json.dumps({"Drums":0.9,"Bass":0.85,"Pad":0.7}));
+                print(get_status()); print(ready_to_submit())
+      Step N: SUBMIT(report)
+    """
+
+    brief: str = dspy.InputField(
+        description="Creative brief describing mood, genre, tempo, and instrumentation"
+    )
+    report: str = dspy.OutputField(
+        description="Summary of the session palette: tempo, tracks, scenes with slot numbers "
+        "and energy levels and clip names, mix levels, key and chords per scene"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tools — closures over a Session instance.
 # Every tool: accepts simple types, returns str, wraps errors.
 # MUST return str — DSPy PythonInterpreter uses Deno+Pyodide sandbox.
 # ---------------------------------------------------------------------------
@@ -164,6 +172,331 @@ def _parse_notes(notes_json):
     return [_clamp_note(n) for n in notes]
 
 
+# ---------------------------------------------------------------------------
+# Music theory helpers (module-level so renderers can use them)
+# ---------------------------------------------------------------------------
+
+_NOTE_NAMES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
+
+_CHORD_INTERVALS = {
+    "maj": [0, 4, 7],
+    "m": [0, 3, 7],
+    "min": [0, 3, 7],
+    "dim": [0, 3, 6],
+    "aug": [0, 4, 8],
+    "7": [0, 4, 7, 10],
+    "dom7": [0, 4, 7, 10],
+    "m7": [0, 3, 7, 10],
+    "min7": [0, 3, 7, 10],
+    "maj7": [0, 4, 7, 11],
+    "dim7": [0, 3, 6, 9],
+    "sus2": [0, 2, 7],
+    "sus4": [0, 5, 7],
+}
+
+_SCALE_INTERVALS = {
+    "major": [0, 2, 4, 5, 7, 9, 11],
+    "minor": [0, 2, 3, 5, 7, 8, 10],
+    "dorian": [0, 2, 3, 5, 7, 9, 10],
+    "pentatonic": [0, 2, 4, 7, 9],
+    "harmonic_minor": [0, 2, 3, 5, 7, 8, 11],
+    "blues": [0, 3, 5, 6, 7, 10],
+}
+
+
+def _note_to_midi(name: str) -> int:
+    """Convert note name to MIDI number. 'F4' -> 65, 'Bb3' -> 58."""
+    s = name.strip()
+    letter = s[0].upper()
+    rest = s[1:]
+    accidental = 0
+    while rest and rest[0] in "#b":
+        accidental += 1 if rest[0] == "#" else -1
+        rest = rest[1:]
+    octave = int(rest) if rest else 4
+    midi = (octave + 1) * 12 + _NOTE_NAMES[letter] + accidental
+    return max(0, min(127, midi))
+
+
+def _parse_chord_name(name: str) -> tuple:
+    """Parse chord string into (root_pitch_class_0_11, interval_list).
+
+    Examples: 'Fm' -> (5, [0,3,7]), 'Cm7' -> (0, [0,3,7,10]),
+              'Ab' -> (8, [0,4,7]), 'Bbdim' -> (10, [0,3,6])
+    """
+    s = name.strip()
+    letter = s[0].upper()
+    rest = s[1:]
+    accidental = 0
+    while rest and rest[0] in "#b":
+        accidental += 1 if rest[0] == "#" else -1
+        rest = rest[1:]
+    root_pc = (_NOTE_NAMES[letter] + accidental) % 12
+    # Match quality — try longest first
+    quality = rest if rest else "maj"
+    intervals = _CHORD_INTERVALS.get(quality)
+    if intervals is None:
+        # Default to major if unrecognized
+        intervals = _CHORD_INTERVALS["maj"]
+    return (root_pc, intervals)
+
+
+def _chord_to_midi(name: str, octave: int) -> list:
+    """Return MIDI pitches for a named chord at a given octave."""
+    root_pc, intervals = _parse_chord_name(name)
+    base = (octave + 1) * 12 + root_pc
+    return [max(0, min(127, base + i)) for i in intervals]
+
+
+# ---------------------------------------------------------------------------
+# Renderers — return list[tuple[pitch, start, dur, vel]]
+# Each uses a seeded Random for deterministic-per-section output.
+# ---------------------------------------------------------------------------
+
+# GM drum map
+_KICK = 36
+_SNARE = 38
+_CLAP = 39
+_CLOSED_HAT = 42
+_OPEN_HAT = 46
+_RIDE = 51
+_PERC = 47
+
+
+def _render_drums(bars, energy, style, section_name="x", beats_per_bar=4):
+    """Render drum notes for a section.
+
+    Returns list of (pitch, start_beat, duration, velocity) tuples.
+    """
+    rng = random.Random(hash(section_name) & 0xFFFFFFFF)
+    notes = []
+    total_beats = bars * beats_per_bar
+    base_vel = int(60 + 60 * energy)
+
+    def v():
+        return max(1, min(127, base_vel + rng.randint(-15, 15)))
+
+    if style == "four_on_floor":
+        for beat in range(total_beats):
+            # Kick on every beat
+            if energy >= 0.0:
+                notes.append((_KICK, float(beat), 0.5, v()))
+            # Closed hat on 8ths
+            if energy >= 0.2:
+                notes.append((_CLOSED_HAT, float(beat), 0.25, v() - 15))
+                notes.append((_CLOSED_HAT, beat + 0.5, 0.25, v() - 25))
+            # Snare/clap on 2 and 4
+            if energy >= 0.4 and beat % beats_per_bar in (1, 3):
+                notes.append(
+                    (_CLAP if rng.random() > 0.5 else _SNARE, float(beat), 0.5, v())
+                )
+            # Open hat on offbeats
+            if energy >= 0.6 and beat % beats_per_bar == 2:
+                notes.append((_OPEN_HAT, beat + 0.5, 0.25, v() - 10))
+            # Ride layer
+            if energy >= 0.6 and beat % 2 == 0:
+                notes.append((_RIDE, float(beat), 0.5, v() - 20))
+            # Fills every 4 bars
+            if energy >= 0.8 and beat % (beats_per_bar * 4) == (beats_per_bar * 4 - 1):
+                for sub in [0.0, 0.25, 0.5, 0.75]:
+                    notes.append((_SNARE, beat + sub, 0.25, v()))
+
+    elif style == "half_time":
+        for beat in range(total_beats):
+            # Kick on 1
+            if beat % beats_per_bar == 0:
+                notes.append((_KICK, float(beat), 0.5, v()))
+            # Snare on 3 only (half time feel)
+            if energy >= 0.3 and beat % beats_per_bar == 2:
+                notes.append((_SNARE, float(beat), 0.5, v()))
+            # Hats
+            if energy >= 0.2:
+                notes.append((_CLOSED_HAT, float(beat), 0.25, v() - 20))
+            if energy >= 0.6 and beat % 2 == 1:
+                notes.append((_OPEN_HAT, float(beat), 0.25, v() - 15))
+
+    elif style == "breakbeat":
+        # Syncopated kick/snare pattern repeating every 2 bars
+        kick_pattern = [0, 0.75, 1.5, 2.5, 3.0]  # offbeat kicks
+        snare_pattern = [1.0, 3.0, 3.5]
+        pattern_len = beats_per_bar * 2
+        for bar_start in range(0, total_beats, pattern_len):
+            for offset in kick_pattern:
+                pos = bar_start + offset
+                if pos < total_beats:
+                    notes.append((_KICK, pos, 0.5, v()))
+            if energy >= 0.4:
+                for offset in snare_pattern:
+                    pos = bar_start + offset
+                    if pos < total_beats:
+                        notes.append((_SNARE, pos, 0.5, v()))
+            if energy >= 0.2:
+                for sub_beat in range(pattern_len * 2):  # 8ths
+                    pos = bar_start + sub_beat * 0.5
+                    if pos < total_beats:
+                        notes.append((_CLOSED_HAT, pos, 0.25, v() - 20))
+
+    elif style == "minimal":
+        for beat in range(total_beats):
+            # Sparse kick — always on beat 0, probabilistic elsewhere
+            if beat % beats_per_bar == 0 and (beat == 0 or rng.random() < 0.7):
+                notes.append((_KICK, float(beat), 0.5, v() - 10))
+            # Occasional hat
+            if energy >= 0.2 and rng.random() < 0.3:
+                notes.append((_CLOSED_HAT, float(beat), 0.25, v() - 25))
+            # Rare snare ghost
+            if energy >= 0.4 and beat % (beats_per_bar * 2) == 3:
+                notes.append((_SNARE, float(beat), 0.5, v() - 20))
+
+    return notes
+
+
+def _render_bass(
+    bars, energy, style, chords, key_root, section_name="x", beats_per_bar=4
+):
+    """Render bass notes for a section.
+
+    chords: list of chord name strings, evenly distributed across bars.
+    Returns list of (pitch, start_beat, duration, velocity) tuples.
+    """
+    rng = random.Random(hash(section_name) & 0xFFFFFFFF)
+    notes = []
+    total_beats = bars * beats_per_bar
+    base_vel = int(50 + 70 * energy)
+
+    if not chords:
+        chords = [key_root]
+
+    # Distribute chords evenly across bars
+    beats_per_chord = total_beats / len(chords)
+
+    for i, chord_name in enumerate(chords):
+        root_pc, _ = _parse_chord_name(chord_name)
+        chord_start = i * beats_per_chord
+        chord_end = chord_start + beats_per_chord
+
+        # Bass octave: 2 normally, occasional jump to 3 at high energy
+        octave = 2
+        root_midi = (octave + 1) * 12 + root_pc
+
+        def v():
+            return max(1, min(127, base_vel + rng.randint(-10, 10)))
+
+        if style == "sustained":
+            # Whole-note / half-note sustained bass
+            dur = beats_per_chord if energy < 0.5 else beats_per_chord / 2
+            beat = chord_start
+            while beat < chord_end - 0.01:
+                notes.append((root_midi, beat, dur, v()))
+                beat += dur
+
+        elif style == "pulsing_8th":
+            beat = chord_start
+            while beat < chord_end - 0.01:
+                pitch = root_midi
+                if energy >= 0.7 and rng.random() < 0.2:
+                    pitch = root_midi + 12  # octave jump
+                dur = 0.4 if energy < 0.5 else 0.45
+                notes.append((pitch, beat, dur, v()))
+                beat += 0.5
+
+        elif style == "offbeat_8th":
+            beat = chord_start + 0.5  # offbeat start
+            while beat < chord_end - 0.01:
+                pitch = root_midi
+                if energy >= 0.7 and rng.random() < 0.15:
+                    pitch = root_midi + 12
+                notes.append((pitch, beat, 0.4, v()))
+                beat += 1.0
+
+        elif style == "rolling_16th":
+            beat = chord_start
+            fifth_midi = root_midi + 7  # perfect fifth
+            while beat < chord_end - 0.01:
+                pitch = root_midi
+                # Add fifth on some 16ths for movement
+                if rng.random() < 0.2:
+                    pitch = fifth_midi
+                if energy >= 0.7 and rng.random() < 0.1:
+                    pitch = root_midi + 12
+                vel = v()
+                # Accent on beat
+                if abs(beat % 1.0) < 0.01:
+                    vel = min(127, vel + 15)
+                notes.append((pitch, beat, 0.2, vel))
+                beat += 0.25
+
+    return notes
+
+
+def _render_pads(
+    bars, energy, style, chords, key_root, section_name="x", beats_per_bar=4
+):
+    """Render pad/chord notes for a section.
+
+    chords: list of chord name strings, evenly distributed across bars.
+    Returns list of (pitch, start_beat, duration, velocity) tuples.
+    """
+    rng = random.Random(hash(section_name) & 0xFFFFFFFF)
+    notes = []
+    total_beats = bars * beats_per_bar
+    base_vel = int(40 + 60 * energy)
+
+    if not chords:
+        chords = [key_root]
+
+    beats_per_chord = total_beats / len(chords)
+
+    for i, chord_name in enumerate(chords):
+        chord_start = i * beats_per_chord
+        chord_end = chord_start + beats_per_chord
+
+        # Voicing octave based on energy
+        if energy < 0.3:
+            # Open voicing: spread across octaves 3-5
+            pitches = _chord_to_midi(chord_name, 3)
+            # Spread: move some notes up an octave
+            if len(pitches) >= 3:
+                pitches = [pitches[0], pitches[1] + 12, pitches[2] + 12]
+                if len(pitches) > 3:
+                    pitches.append(pitches[3] + 24)
+        elif energy < 0.7:
+            # Close voicing in octave 4
+            pitches = _chord_to_midi(chord_name, 4)
+        else:
+            # Stacked voicing: octave 3 + 4
+            low = _chord_to_midi(chord_name, 3)
+            high = _chord_to_midi(chord_name, 4)
+            pitches = low + high
+
+        def v():
+            return max(1, min(127, base_vel + rng.randint(-8, 8)))
+
+        if style == "sustained":
+            dur = beats_per_chord
+            for p in pitches:
+                notes.append((p, chord_start, dur, v()))
+
+        elif style == "atmospheric":
+            # Longer notes with slight overlap for wash effect
+            dur = beats_per_chord + 0.5
+            for p in pitches:
+                notes.append((p, chord_start, dur, v()))
+
+        elif style == "pulsing":
+            # Rhythmic chords — quarter or half note pulses
+            pulse = 2.0 if energy < 0.5 else 1.0
+            gap = 0.25
+            beat = chord_start
+            while beat < chord_end - 0.01:
+                dur = pulse - gap
+                for p in pitches:
+                    notes.append((p, beat, dur, v()))
+                beat += pulse
+
+    return notes
+
+
 def make_tools(session, min_clips=6):
     """Create 22 tool closures over a live Session, with milestone tracking."""
 
@@ -176,6 +509,9 @@ def make_tools(session, min_clips=6):
         "mix": False,
         "status_checks": 0,
     }
+
+    # Track role map: {"TrackName": "drums"|"bass"|"pad"} — set by create_tracks()
+    _track_roles = {}
 
     def set_tempo(bpm: int) -> str:
         """Set the project tempo in BPM."""
@@ -211,15 +547,23 @@ def make_tools(session, min_clips=6):
             return f"Error: {e}"
 
     def create_tracks(tracks_json: str) -> str:
-        """Create MIDI tracks from a JSON array of {name, sound?, instrument?, drum_kit?, effects?, volume?, pan?}.
+        """Create MIDI tracks. REPLACES ALL existing tracks — call ONCE with full layout.
 
-        Replaces ALL existing tracks. Call once with your full track layout.
-        Specify sound/instrument/drum_kit to load them automatically during setup.
-        volume: 0.0-1.0 (default 0.85). pan: -1.0 to 1.0 (default 0.0).
+        Args:
+            tracks_json: JSON array of track specs, each with:
+              name (required), sound/instrument/drum_kit (pick one to auto-load),
+              effects (list of effect names), volume (0.0-1.0), pan (-1.0 to 1.0)
+
+        Example: json.dumps([
+            {"name": "Drums", "drum_kit": "909 Core Kit.adg", "volume": 0.9},
+            {"name": "Bass", "instrument": "Operator", "volume": 0.85},
+            {"name": "Pad", "sound": "Drifting Ambient Pad.adv", "volume": 0.8}
+        ])
         """
         try:
             _done["tracks"] = True
             specs = json.loads(tracks_json)
+            _track_roles.clear()
             tracks = []
             for s in specs:
                 tracks.append(
@@ -233,6 +577,13 @@ def make_tools(session, min_clips=6):
                         pan=s.get("pan", 0.0),
                     )
                 )
+                # Auto-detect track role for write_section()
+                if s.get("drum_kit"):
+                    _track_roles[s["name"]] = "drums"
+                elif "bass" in s["name"].lower():
+                    _track_roles[s["name"]] = "bass"
+                else:
+                    _track_roles[s["name"]] = "pad"
             count = session.setup(tracks)
             return json.dumps(
                 {"tracks_created": count, "names": [t.name for t in tracks]}
@@ -241,10 +592,16 @@ def make_tools(session, min_clips=6):
             return json.dumps({"error": str(e)})
 
     def browse(query: str, category: str = "") -> str:
-        """Search Ableton browser. Returns matching names, one per line.
+        """Search Ableton browser for instruments, sounds, drums, or effects.
+        Returns matching names as plain text, one per line (NOT JSON).
 
-        Optional category filter: 'Instruments', 'Sounds', 'Drums', 'Audio Effects'.
-        Use result.split('\\n') to get a list of names.
+        Args:
+            query: Search term (e.g. "909", "strings", "Operator")
+            category: Optional filter — 'Instruments', 'Sounds', 'Drums', 'Audio Effects'
+
+        Returns NO_RESULTS if nothing matches — try broader terms.
+        Example: browse("909", "Drums") might return "909 Core Kit.adg\\nClap 909.aif\\n..."
+        Parse with: names = result.split('\\n')
         """
         try:
             _done["browse"] = True
@@ -311,10 +668,20 @@ def make_tools(session, min_clips=6):
     def create_clip(
         track: str, slot: int, length_beats: float, notes_json: str, name: str = ""
     ) -> str:
-        """Create a session MIDI clip. notes_json: [[pitch, start_beat, duration, velocity], ...].
+        """Create a session MIDI clip (loopable, good for jamming).
 
-        start_beat is relative to clip start (0 = first beat of clip).
-        Pitch 0-127, start >= 0, duration >= 0.01, velocity 1-127.
+        Args:
+            track: Track name (must match a name from create_tracks)
+            slot: Section index (0, 1, 2, ...) — each slot is one clip
+            length_beats: Clip length in beats (e.g. 16.0 = 4 bars in 4/4)
+            notes_json: JSON array of [pitch, start_beat, duration, velocity]
+            name: Clip name for the arrangement display
+
+        Note format: [pitch, start_beat, duration, velocity]
+          - start_beat is RELATIVE to clip start (0 = first beat of clip)
+          - Pitch 0-127, velocity 1-127 (VARY velocity — flat = robotic)
+          - Duration: bass/pads = full bar (4.0), melody = mixed lengths
+          - Velocity dynamics: pp=30, p=50, mp=65, mf=80, f=100, ff=120
         """
         try:
             _done["clips"] += 1
@@ -333,10 +700,18 @@ def make_tools(session, min_clips=6):
         notes_json: str,
         name: str = "",
     ) -> str:
-        """Create an arrangement clip at a beat position. notes_json: [[pitch, start, dur, vel], ...].
+        """Create an arrangement clip on the timeline (good for linear pieces).
 
-        IMPORTANT: Note start times are RELATIVE to clip start (0 = first beat of clip).
-        Do NOT use absolute beat positions. Pitch 0-127, velocity 1-127.
+        Args:
+            track: Track name
+            start_beat: Position on timeline in beats (0 = bar 1, 16 = bar 5, etc.)
+            length_beats: Clip length in beats
+            notes_json: JSON array of [pitch, start_beat, duration, velocity]
+            name: Clip name shown in arrangement
+
+        IMPORTANT: Note start_beat values are RELATIVE to the clip start (0 = first
+        beat of THIS clip), NOT absolute timeline positions.
+        See create_clip() docstring for note format and velocity guidance.
         """
         try:
             _done["clips"] += 1
@@ -510,6 +885,160 @@ def make_tools(session, min_clips=6):
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    def write_section(section_json: str) -> str:
+        """Write a full section to the arrangement timeline.
+
+        Args:
+            section_json: JSON object with:
+              name (str): Section name, e.g. "Intro", "Build A", "Peak", "Break"
+              start_beat (int): Timeline position in beats (0 = bar 1)
+              bars (int): Section length in bars
+              energy (float): 0.0 (silent/sparse) to 1.0 (full power)
+              chords (list[str]): Chord names, e.g. ["Fm", "Cm7", "Ab", "Eb"]
+              key (str): Key root note, e.g. "F"
+              drums (str): "four_on_floor"|"half_time"|"breakbeat"|"minimal"|"none"
+              bass (str): "rolling_16th"|"offbeat_8th"|"pulsing_8th"|"sustained"|"none"
+              pad (str): "sustained"|"atmospheric"|"pulsing"|"none"
+
+        Renders drums, bass, and pad clips for this section based on energy level
+        and style. Each track with a matching role gets an arrangement clip.
+        Returns JSON summary of clips created.
+        """
+        try:
+            sec = json.loads(section_json)
+            name = sec["name"]
+            start_beat = float(sec["start_beat"])
+            bars = int(sec["bars"])
+            energy = max(0.0, min(1.0, float(sec["energy"])))
+            chords = sec.get("chords", [])
+            key_root = sec.get("key", "C")
+            drum_style = sec.get("drums", "none")
+            bass_style = sec.get("bass", "none")
+            pad_style = sec.get("pad", "none")
+            length_beats = bars * 4
+
+            clips_created = 0
+            details = []
+
+            for track_name, role in _track_roles.items():
+                notes = []
+                clip_name = ""
+
+                if role == "drums" and drum_style != "none":
+                    notes = _render_drums(bars, energy, drum_style, section_name=name)
+                    clip_name = f"Drums {name}"
+                elif role == "bass" and bass_style != "none":
+                    notes = _render_bass(
+                        bars, energy, bass_style, chords, key_root, section_name=name
+                    )
+                    clip_name = f"Bass {name}"
+                elif role == "pad" and pad_style != "none":
+                    notes = _render_pads(
+                        bars, energy, pad_style, chords, key_root, section_name=name
+                    )
+                    clip_name = f"Pad {name}"
+
+                if notes:
+                    clamped = [_clamp_note(n) for n in notes]
+                    session.arr_clip(
+                        track_name,
+                        start_beat,
+                        float(length_beats),
+                        clamped,
+                        name=clip_name,
+                    )
+                    clips_created += 1
+                    details.append(f"{clip_name}: {len(clamped)} notes")
+
+            _done["clips"] += clips_created
+            return json.dumps(
+                {
+                    "section": name,
+                    "clips_created": clips_created,
+                    "bars": bars,
+                    "energy": energy,
+                    "details": details,
+                }
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def write_clip(clip_json: str) -> str:
+        """Write a looping clip to the session grid.
+
+        Args:
+            clip_json: JSON object with:
+              name (str): Clip name, e.g. "Main Groove", "Breakdown Pad"
+              slot (int): Scene/row index (0, 1, 2, ...) — each scene is a
+                          different energy level or section type
+              bars (int): Loop length in bars (typically 4 or 8)
+              energy (float): 0.0 (silent/sparse) to 1.0 (full power)
+              chords (list[str]): Chord names, e.g. ["Fm", "Cm7"]
+              key (str): Key root note, e.g. "F"
+              drums (str): "four_on_floor"|"half_time"|"breakbeat"|"minimal"|"none"
+              bass (str): "rolling_16th"|"offbeat_8th"|"pulsing_8th"|"sustained"|"none"
+              pad (str): "sustained"|"atmospheric"|"pulsing"|"none"
+
+        Creates looping session clips for each track role. Clips in the same
+        slot (scene) can be fired together for instant transitions.
+        Returns JSON summary of clips created.
+        """
+        try:
+            c = json.loads(clip_json)
+            name = c["name"]
+            slot = int(c["slot"])
+            bars = int(c["bars"])
+            energy = max(0.0, min(1.0, float(c["energy"])))
+            chords = c.get("chords", [])
+            key_root = c.get("key", "C")
+            drum_style = c.get("drums", "none")
+            bass_style = c.get("bass", "none")
+            pad_style = c.get("pad", "none")
+            length_beats = float(bars * 4)
+
+            clips_created = 0
+            details = []
+
+            for track_name, role in _track_roles.items():
+                notes = []
+                clip_name = ""
+
+                if role == "drums" and drum_style != "none":
+                    notes = _render_drums(bars, energy, drum_style, section_name=name)
+                    clip_name = f"Drums {name}"
+                elif role == "bass" and bass_style != "none":
+                    notes = _render_bass(
+                        bars, energy, bass_style, chords, key_root, section_name=name
+                    )
+                    clip_name = f"Bass {name}"
+                elif role == "pad" and pad_style != "none":
+                    notes = _render_pads(
+                        bars, energy, pad_style, chords, key_root, section_name=name
+                    )
+                    clip_name = f"Pad {name}"
+
+                if notes:
+                    clamped = [_clamp_note(n) for n in notes]
+                    session.clip(
+                        track_name, slot, length_beats, clamped, name=clip_name
+                    )
+                    clips_created += 1
+                    details.append(f"{clip_name}: {len(clamped)} notes")
+
+            _done["clips"] += clips_created
+            return json.dumps(
+                {
+                    "clip": name,
+                    "slot": slot,
+                    "clips_created": clips_created,
+                    "bars": bars,
+                    "energy": energy,
+                    "details": details,
+                }
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
     def ready_to_submit() -> str:
         """Check if composition is complete enough to SUBMIT.
 
@@ -536,7 +1065,8 @@ def make_tools(session, min_clips=6):
             return "NOT READY to submit:\n" + "\n".join(f"  - {i}" for i in issues)
         return "READY — call SUBMIT(report) in the NEXT step (no other tool calls)."
 
-    return [
+    # Common tools shared by both modes
+    _common = [
         set_tempo,
         get_status,
         create_tracks,
@@ -545,21 +1075,30 @@ def make_tools(session, min_clips=6):
         load_sound,
         load_effect,
         load_drum_kit,
-        create_clip,
-        create_arrangement_clip,
         get_params,
         set_param,
         set_mix,
         play,
         stop,
         fire_clip,
-        get_arrangement,
-        clear_arrangement,
-        note,
-        chord,
-        scale,
         ready_to_submit,
     ]
+
+    return {
+        "arrangement": _common
+        + [
+            create_clip,
+            create_arrangement_clip,
+            get_arrangement,
+            clear_arrangement,
+            write_section,
+        ],
+        "session": _common
+        + [
+            create_clip,
+            write_clip,
+        ],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +1181,12 @@ def parse_args():
         help="Minimum clips before ready_to_submit() allows SUBMIT",
     )
     p.add_argument(
+        "--mode",
+        choices=["arrangement", "session"],
+        default="arrangement",
+        help="Composition mode: 'arrangement' (timeline) or 'session' (clip grid)",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Print config and tools, don't connect to Ableton",
@@ -667,7 +1212,11 @@ def main():
     sub_lm = dspy.LM(args.sub_model, cache=False) if args.sub_model else lm
     dspy.configure(lm=lm)
 
+    # Select signature based on mode
+    sig = ComposeSession if args.mode == "session" else Compose
+
     print("=== DSPy RLM Composer ===")
+    print(f"  Mode:       {args.mode}")
     print(f"  Model:      {args.model}")
     print(f"  Sub-model:  {args.sub_model or args.model}")
     print(f"  Iterations: {args.max_iterations}")
@@ -678,49 +1227,20 @@ def main():
     print()
 
     if args.dry_run:
-        print("  [DRY RUN] Tools:")
-        for fn in make_tools.__code__.co_consts:
-            if isinstance(fn, str) and fn.startswith("    "):
-                continue
-        # Show tool names from a dummy list
-        tool_names = [
-            "set_tempo",
-            "get_status",
-            "create_tracks",
-            "browse",
-            "load_instrument",
-            "load_sound",
-            "load_effect",
-            "load_drum_kit",
-            "create_clip",
-            "create_arrangement_clip",
-            "get_params",
-            "set_param",
-            "set_mix",
-            "play",
-            "stop",
-            "fire_clip",
-            "get_arrangement",
-            "clear_arrangement",
-            "note",
-            "chord",
-            "scale",
-            "ready_to_submit",
-        ]
-        for name in tool_names:
-            print(f"    - {name}")
-        print(f"\n  [DRY RUN] Guide ({len(GUIDE)} chars):")
-        print(GUIDE[:200] + "...")
+        print(f"  [DRY RUN] Signature: {sig.__name__}")
+        print(f"  [DRY RUN] Docstring ({len(sig.__doc__)} chars):")
+        print(sig.__doc__[:300] + "...")
         print("\n  [DRY RUN] Would connect to Ableton and run RLM. Exiting.")
         return
 
     # Connect to Ableton
     session = Session()
-    tools = make_tools(session, min_clips=args.min_clips)
+    tools_by_mode = make_tools(session, min_clips=args.min_clips)
+    tools = tools_by_mode[args.mode]
 
-    # Build RLM
+    # Build RLM — signature docstring IS the prompt (highest priority)
     composer = dspy.RLM(
-        signature="brief, guide -> report",
+        sig,
         max_iterations=args.max_iterations,
         max_llm_calls=args.max_llm_calls,
         max_output_chars=15000,
@@ -731,7 +1251,7 @@ def main():
 
     try:
         print("  Starting composition...\n")
-        prediction = composer(brief=brief, guide=GUIDE)
+        prediction = composer(brief=brief)
         print("\n  === Report ===")
         print(f"  {prediction.report}")
         save_trajectory(prediction, brief, args.log_dir)
