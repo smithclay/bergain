@@ -228,3 +228,57 @@ The most cost-effective tool in the pipeline. Renders 100 random palettes agains
 The diagnostic tool that finally explained the reference-vs-DJ gap. Runs 4 experiments varying duration (32/64 bars) and source (reference/DJ) to decompose the gap into independent factors.
 
 **This tool proved**: The gap is ~50% scorer duration sensitivity and ~50% DJ decision variance. Arc structure barely matters. Without this decomposition, we would have spent more iterations tweaking arc phases when the real issue was elsewhere.
+
+## Live Compose Mode: DJ Shaping Lessons
+
+These lessons come from integrating DJ shaping research (emusicology article on how DJs shape performances) into `compose_next()` — the live-mode tool where a conductor LM sends creative prompts to a sub-LM that returns musical parameters.
+
+### The Sub-LM Energy Ceiling Problem
+
+Without calibration, the sub-LM (GPT-5 via OpenRouter) **caps energy at ~0.4 regardless of prompt intensity**. Prompts like "relentless peak", "full power", and "maximum intensity" all produced energy=0.3-0.4. The sub-LM plays it safe because `energy (float): 0.0 to 1.0` gives no anchor for what values mean.
+
+**Fix: One calibration line in the sub-LM prompt.** Adding `0.2=ambient, 0.4=gentle groove, 0.6=driving, 0.8=peak power, 0.95=maximum` to the energy field description pushed peak sections to 0.76-0.95. This is the single highest-impact change — energy range went from 0.05-0.40 to 0.22-0.95.
+
+**Fix: Phase-based energy floor.** Middle-phase sections get a floor of 0.3 energy, so the "building" part of the arc actually builds. Opening phase gets a ceiling of 0.55 to prevent premature peaks.
+
+**Fix: Bars cap for high-energy sections.** The sub-LM defaults to 16-bar loops for everything. High-energy peaks need tighter 4-8 bar loops. Capping bars at 8 when energy ≥ 0.6 during middle phase enforces this automatically.
+
+**Pattern**: All three fixes are tool-layer guardrails that post-process the sub-LM's output. The sub-LM doesn't know it's being clamped. This is consistent with the core lesson: server-side guardrails > prompt instructions.
+
+### DSPy LM Return Type Gotcha
+
+`dspy.LM()` returns **dicts with a `text` key**, not plain strings:
+```python
+completions = sub_lm(messages=[...])
+# completions[0] = {'text': '{"name": "..."}', 'reasoning_content': '...'}
+# NOT: completions[0] = '{"name": "..."}'
+```
+Calling `re.search()` on the raw dict crashes with `"expected string or bytes-like object, got 'dict'"`. Extract with `raw.get("text")` before parsing.
+
+### Texture Density ≠ Energy
+
+A loud minimal section (high energy, low density) is fundamentally different from a quiet layered ambient pad (low energy, high density). Tracking density as `count_of_active_instruments / total_instruments` alongside energy gives the conductor LM a second dimension for shaping decisions. In practice, `density_avg` stays 0.78-1.0 because the sub-LM rarely drops instruments to "none".
+
+### Breakdown Nudge: Wired But Rarely Fires
+
+The breakdown nudge detects 3+ consecutive sections ≥ 0.6 energy without bass="none" and injects a one-line suggestion. In testing, the sub-LM rarely sustains energy high enough for 3 sections to trigger this — even with energy guardrails, the sub-LM's creative instinct is to vary. The nudge is a safety net for longer performances where energy could plateau.
+
+### Transition Fades: Need Extreme Contrast
+
+Fading out tracks that go from active to "none" between sections sounds great in theory, but the sub-LM rarely makes that drastic a change. Most transitions keep all instruments active and just change styles. Fades trigger most reliably on explicit breakdowns (drums "none" → everything, or vice versa).
+
+### RLM Iteration Budget
+
+The conductor RLM (using `dspy.RLM`) consistently spends **2-4 iterations on setup** (browsing for instruments, creating tracks, fixing failed drum kit loads) before any `compose_next()` calls. With a 3-minute target, this leaves time for only 1-2 composed sections. With 8 minutes, you get 4-5 sections — enough for a proper arc.
+
+**Rule of thumb**: budget at least 5 minutes of target duration for live compose. Each `compose_next()` takes ~60-90 seconds (sub-LM call + clip writing + wait time for bars to play).
+
+### The Contrast Metric
+
+`avg_contrast = mean(|energy_delta| + 0.1 * style_changes)` between adjacent sections. When this drops below ~0.1 AND instruments stay the same for 3+ sections, the arc summary flags a monotony warning. In practice, the sub-LM varies styles well (6 unique combos across 6 sections is typical), so monotony is more about energy flatness than style repetition.
+
+### What We Confirmed
+
+- **Simpler prompts still win** — we added zero text to the conductor LM's signature docstring. All improvements were tool-layer mechanics.
+- **Named patterns remain the right abstraction** — the sub-LM reliably generates `"four_on_floor"`, `"rolling_16th"`, `"swells"` etc. No need for note-level control.
+- **The RLM is a good conductor** — when compose_next works, the RLM makes intelligent creative choices about when to build, when to break down, and when to peak. It reads the arc summary and adjusts. The weak link was always the sub-LM's energy calibration, not the conductor's musical judgment.
