@@ -6,7 +6,7 @@ decisions happen through programmatic llm_query() calls in loops, results
 accumulate in Python variables, and tools realize them in the DAW.
 
 Usage:
-    uv run python compose.py "A melancholy waltz in G minor, harpsichord and strings"
+    uv run python compose.py "Dark Berlin techno in F minor, 130 BPM, driving kick"
     uv run python compose.py --brief-file brief.txt
     uv run python compose.py --model openrouter/openai/gpt-5 "Dark ambient in Eb"
     uv run python compose.py --dry-run "Test brief"
@@ -33,61 +33,6 @@ load_dotenv()
 
 
 class Compose(dspy.Signature):
-    """You are composing music in a live DAW by writing Python code that calls
-    music tools. Describe the SHAPE of each section (energy, style, chords)
-    and write_section() renders the MIDI notes for you.
-
-    WORKFLOW — one phase per code step, never combine phases:
-      1. BROWSE & SETUP: browse() + create_tracks() + set_tempo() — all in ONE step.
-      2. PLAN: llm_query() for creative decisions — key, energy arc, chord progression
-         per section. Must cover FULL duration. Request JSON, parse with re.search.
-      3. COMPOSE: write_section() — ONE call per section, sequential on timeline.
-      4. MIX: set_mix() + get_status() + ready_to_submit()
-      5. SUBMIT: SUBMIT(report) alone.
-
-    RULES:
-      - Use llm_query() to decide key, chords, energy arc, and style names.
-      - write_section() handles all MIDI rendering — you never build note arrays.
-      - Each section needs DIFFERENT energy/style/chords — monotony is failure.
-      - ready_to_submit() checks milestones. Only SUBMIT after it says READY.
-      - Most tools return JSON (parse with json.loads). Exceptions: browse() and
-        get_status() return plain text.
-
-    EXAMPLE (each step = one code block, separate execution):
-      Step 1: browse("909", "Drums"); create_tracks(json.dumps([
-                {"name":"Drums","drum_kit":"909 Core Kit.adg"},
-                {"name":"Bass","instrument":"Operator"},
-                {"name":"Pad","sound":"Warm Pad"}])); set_tempo(130)
-      Step 2: plan = llm_query('Dark techno in F minor, 96 bars (3 min at 130).
-                Return JSON: {"key":"F","sections":[
-                  {"name":"Intro","bars":16,"energy":0.3,"chords":["Fm","Cm"],
-                   "drums":"minimal","bass":"sustained","pad":"atmospheric"},
-                  {"name":"Build","bars":16,"energy":0.6,
-                   "chords":["Fm","Cm7","Ab","Eb"],
-                   "drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"},
-                  ...]}')
-      Step 3: write_section(json.dumps({"name":"Intro","start_beat":0,"bars":16,
-                "energy":0.3,"key":"F","chords":["Fm","Cm"],
-                "drums":"minimal","bass":"sustained","pad":"atmospheric"}))
-      Step 4: write_section(json.dumps({"name":"Build","start_beat":64,"bars":16,
-                "energy":0.6,"key":"F","chords":["Fm","Cm7","Ab","Eb"],
-                "drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"}))
-      ...
-      Step N-1: set_mix(json.dumps({"Drums":0.9,"Bass":0.85,"Pad":0.7}));
-                print(get_status()); print(ready_to_submit())
-      Step N: SUBMIT(report)
-    """
-
-    brief: str = dspy.InputField(
-        description="Creative brief describing mood, genre, tempo, instrumentation, and duration"
-    )
-    report: str = dspy.OutputField(
-        description="Summary of what was BUILT in the DAW: tempo, tracks with loaded devices, "
-        "sections with bar ranges and clip names and note counts, mix levels, key and progression"
-    )
-
-
-class ComposeSession(dspy.Signature):
     """You are building a live performance palette in a DAW by writing Python
     code. Build a grid of looping clips organized by SCENE (energy level).
     The human DJ fires scenes to perform the arrangement live.
@@ -497,8 +442,13 @@ def _render_pads(
     return notes
 
 
+# ---------------------------------------------------------------------------
+# Tool closures
+# ---------------------------------------------------------------------------
+
+
 def make_tools(session, min_clips=6):
-    """Create 22 tool closures over a live Session, with milestone tracking."""
+    """Create tool closures over a live Session, with milestone tracking."""
 
     # Milestone tracker — shared mutable state across all tool closures.
     # ready_to_submit() checks these before allowing SUBMIT.
@@ -577,7 +527,7 @@ def make_tools(session, min_clips=6):
                         pan=s.get("pan", 0.0),
                     )
                 )
-                # Auto-detect track role for write_section()
+                # Auto-detect track role for write_clip()
                 if s.get("drum_kit"):
                     _track_roles[s["name"]] = "drums"
                 elif "bass" in s["name"].lower():
@@ -668,56 +618,24 @@ def make_tools(session, min_clips=6):
     def create_clip(
         track: str, slot: int, length_beats: float, notes_json: str, name: str = ""
     ) -> str:
-        """Create a session MIDI clip (loopable, good for jamming).
+        """Create a session MIDI clip (loopable).
 
         Args:
             track: Track name (must match a name from create_tracks)
-            slot: Section index (0, 1, 2, ...) — each slot is one clip
+            slot: Scene/row index (0, 1, 2, ...) — each slot is one clip
             length_beats: Clip length in beats (e.g. 16.0 = 4 bars in 4/4)
             notes_json: JSON array of [pitch, start_beat, duration, velocity]
-            name: Clip name for the arrangement display
+            name: Clip name for the session display
 
         Note format: [pitch, start_beat, duration, velocity]
           - start_beat is RELATIVE to clip start (0 = first beat of clip)
           - Pitch 0-127, velocity 1-127 (VARY velocity — flat = robotic)
-          - Duration: bass/pads = full bar (4.0), melody = mixed lengths
-          - Velocity dynamics: pp=30, p=50, mp=65, mf=80, f=100, ff=120
         """
         try:
             _done["clips"] += 1
             notes = _parse_notes(notes_json)
             result = session.clip(
                 track, int(slot), float(length_beats), notes, name=name
-            )
-            return json.dumps(result)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    def create_arrangement_clip(
-        track: str,
-        start_beat: float,
-        length_beats: float,
-        notes_json: str,
-        name: str = "",
-    ) -> str:
-        """Create an arrangement clip on the timeline (good for linear pieces).
-
-        Args:
-            track: Track name
-            start_beat: Position on timeline in beats (0 = bar 1, 16 = bar 5, etc.)
-            length_beats: Clip length in beats
-            notes_json: JSON array of [pitch, start_beat, duration, velocity]
-            name: Clip name shown in arrangement
-
-        IMPORTANT: Note start_beat values are RELATIVE to the clip start (0 = first
-        beat of THIS clip), NOT absolute timeline positions.
-        See create_clip() docstring for note format and velocity guidance.
-        """
-        try:
-            _done["clips"] += 1
-            notes = _parse_notes(notes_json)
-            result = session.arr_clip(
-                track, float(start_beat), float(length_beats), notes, name=name
             )
             return json.dumps(result)
         except Exception as e:
@@ -785,181 +703,11 @@ def make_tools(session, min_clips=6):
         except Exception as e:
             return json.dumps({"error": str(e)})
 
-    def get_arrangement() -> str:
-        """Get the current arrangement clip layout."""
+    def fire_scene(slot: int) -> str:
+        """Fire a scene (all clips in a row) by slot index. Use for live transitions."""
         try:
-            clips = session.arrangement()
-            return json.dumps(clips)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    def clear_arrangement() -> str:
-        """Delete all arrangement clips from all tracks."""
-        try:
-            session.clear_arrangement()
-            return json.dumps({"cleared": True})
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    # -- Music theory helpers (eliminate RLM boilerplate) --
-
-    _NOTE_NAMES = {"C": 0, "D": 2, "E": 4, "F": 5, "G": 7, "A": 9, "B": 11}
-
-    def note(name: str) -> str:
-        """Convert note name to MIDI number. e.g. note("G3") -> "55", note("Eb4") -> "63"."""
-        try:
-            s = name.strip()
-            letter = s[0].upper()
-            rest = s[1:]
-            accidental = 0
-            while rest and rest[0] in "#b":
-                accidental += 1 if rest[0] == "#" else -1
-                rest = rest[1:]
-            octave = int(rest)
-            midi = (octave + 1) * 12 + _NOTE_NAMES[letter] + accidental
-            return str(max(0, min(127, midi)))
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    _CHORD_INTERVALS = {
-        "maj": [0, 4, 7],
-        "min": [0, 3, 7],
-        "dim": [0, 3, 6],
-        "aug": [0, 4, 8],
-        "dom7": [0, 4, 7, 10],
-        "min7": [0, 3, 7, 10],
-        "maj7": [0, 4, 7, 11],
-        "dim7": [0, 3, 6, 9],
-    }
-
-    def chord(root: str, quality: str, octave: int) -> str:
-        """Return MIDI pitches for a chord. e.g. chord("G", "min", 4) -> "[55, 58, 62]".
-
-        Qualities: maj, min, dim, aug, dom7, min7, maj7, dim7.
-        """
-        try:
-            base = (int(octave) + 1) * 12 + _NOTE_NAMES[root[0].upper()]
-            acc = root[1:]
-            for c in acc:
-                base += 1 if c == "#" else -1
-            intervals = _CHORD_INTERVALS.get(quality)
-            if intervals is None:
-                return json.dumps(
-                    {
-                        "error": f"Unknown quality '{quality}'. Use: {list(_CHORD_INTERVALS.keys())}"
-                    }
-                )
-            pitches = [max(0, min(127, base + i)) for i in intervals]
-            return json.dumps(pitches)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    _SCALE_INTERVALS = {
-        "major": [0, 2, 4, 5, 7, 9, 11],
-        "minor": [0, 2, 3, 5, 7, 8, 10],
-        "dorian": [0, 2, 3, 5, 7, 9, 10],
-        "pentatonic": [0, 2, 4, 7, 9],
-        "harmonic_minor": [0, 2, 3, 5, 7, 8, 11],
-        "blues": [0, 3, 5, 6, 7, 10],
-    }
-
-    def scale(root: str, mode: str, octave: int) -> str:
-        """Return one octave of scale pitches. e.g. scale("G", "minor", 4) -> "[55, 57, 58, 60, 62, 63, 65]".
-
-        Modes: major, minor, dorian, pentatonic, harmonic_minor, blues.
-        """
-        try:
-            base = (int(octave) + 1) * 12 + _NOTE_NAMES[root[0].upper()]
-            acc = root[1:]
-            for c in acc:
-                base += 1 if c == "#" else -1
-            intervals = _SCALE_INTERVALS.get(mode)
-            if intervals is None:
-                return json.dumps(
-                    {
-                        "error": f"Unknown mode '{mode}'. Use: {list(_SCALE_INTERVALS.keys())}"
-                    }
-                )
-            pitches = [max(0, min(127, base + i)) for i in intervals]
-            return json.dumps(pitches)
-        except Exception as e:
-            return json.dumps({"error": str(e)})
-
-    def write_section(section_json: str) -> str:
-        """Write a full section to the arrangement timeline.
-
-        Args:
-            section_json: JSON object with:
-              name (str): Section name, e.g. "Intro", "Build A", "Peak", "Break"
-              start_beat (int): Timeline position in beats (0 = bar 1)
-              bars (int): Section length in bars
-              energy (float): 0.0 (silent/sparse) to 1.0 (full power)
-              chords (list[str]): Chord names, e.g. ["Fm", "Cm7", "Ab", "Eb"]
-              key (str): Key root note, e.g. "F"
-              drums (str): "four_on_floor"|"half_time"|"breakbeat"|"minimal"|"none"
-              bass (str): "rolling_16th"|"offbeat_8th"|"pulsing_8th"|"sustained"|"none"
-              pad (str): "sustained"|"atmospheric"|"pulsing"|"none"
-
-        Renders drums, bass, and pad clips for this section based on energy level
-        and style. Each track with a matching role gets an arrangement clip.
-        Returns JSON summary of clips created.
-        """
-        try:
-            sec = json.loads(section_json)
-            name = sec["name"]
-            start_beat = float(sec["start_beat"])
-            bars = int(sec["bars"])
-            energy = max(0.0, min(1.0, float(sec["energy"])))
-            chords = sec.get("chords", [])
-            key_root = sec.get("key", "C")
-            drum_style = sec.get("drums", "none")
-            bass_style = sec.get("bass", "none")
-            pad_style = sec.get("pad", "none")
-            length_beats = bars * 4
-
-            clips_created = 0
-            details = []
-
-            for track_name, role in _track_roles.items():
-                notes = []
-                clip_name = ""
-
-                if role == "drums" and drum_style != "none":
-                    notes = _render_drums(bars, energy, drum_style, section_name=name)
-                    clip_name = f"Drums {name}"
-                elif role == "bass" and bass_style != "none":
-                    notes = _render_bass(
-                        bars, energy, bass_style, chords, key_root, section_name=name
-                    )
-                    clip_name = f"Bass {name}"
-                elif role == "pad" and pad_style != "none":
-                    notes = _render_pads(
-                        bars, energy, pad_style, chords, key_root, section_name=name
-                    )
-                    clip_name = f"Pad {name}"
-
-                if notes:
-                    clamped = [_clamp_note(n) for n in notes]
-                    session.arr_clip(
-                        track_name,
-                        start_beat,
-                        float(length_beats),
-                        clamped,
-                        name=clip_name,
-                    )
-                    clips_created += 1
-                    details.append(f"{clip_name}: {len(clamped)} notes")
-
-            _done["clips"] += clips_created
-            return json.dumps(
-                {
-                    "section": name,
-                    "clips_created": clips_created,
-                    "bars": bars,
-                    "energy": energy,
-                    "details": details,
-                }
-            )
+            session.fire(int(slot))
+            return json.dumps({"fired_scene": int(slot)})
         except Exception as e:
             return json.dumps({"error": str(e)})
 
@@ -1053,7 +801,7 @@ def make_tools(session, min_clips=6):
             issues.append("create_tracks() not called — set up your tracks")
         if _done["clips"] < min_clips:
             issues.append(
-                f"only {_done['clips']} clips created (need at least {min_clips}) — build more sections"
+                f"only {_done['clips']} clips created (need at least {min_clips}) — build more scenes"
             )
         if not _done["mix"]:
             issues.append("set_mix() not called — balance volumes and panning")
@@ -1065,8 +813,7 @@ def make_tools(session, min_clips=6):
             return "NOT READY to submit:\n" + "\n".join(f"  - {i}" for i in issues)
         return "READY — call SUBMIT(report) in the NEXT step (no other tool calls)."
 
-    # Common tools shared by both modes
-    _common = [
+    return [
         set_tempo,
         get_status,
         create_tracks,
@@ -1075,30 +822,17 @@ def make_tools(session, min_clips=6):
         load_sound,
         load_effect,
         load_drum_kit,
+        create_clip,
         get_params,
         set_param,
         set_mix,
         play,
         stop,
         fire_clip,
+        fire_scene,
+        write_clip,
         ready_to_submit,
     ]
-
-    return {
-        "arrangement": _common
-        + [
-            create_clip,
-            create_arrangement_clip,
-            get_arrangement,
-            clear_arrangement,
-            write_section,
-        ],
-        "session": _common
-        + [
-            create_clip,
-            write_clip,
-        ],
-    }
 
 
 # ---------------------------------------------------------------------------
@@ -1154,7 +888,7 @@ def parse_args():
         "brief",
         nargs="?",
         default="",
-        help="Creative brief (mood, genre, duration, instrumentation)",
+        help="Creative brief (mood, genre, instrumentation)",
     )
     p.add_argument("--brief-file", help="Read brief from a file")
     p.add_argument(
@@ -1179,12 +913,6 @@ def parse_args():
         type=int,
         default=6,
         help="Minimum clips before ready_to_submit() allows SUBMIT",
-    )
-    p.add_argument(
-        "--mode",
-        choices=["arrangement", "session"],
-        default="arrangement",
-        help="Composition mode: 'arrangement' (timeline) or 'session' (clip grid)",
     )
     p.add_argument(
         "--dry-run",
@@ -1212,11 +940,7 @@ def main():
     sub_lm = dspy.LM(args.sub_model, cache=False) if args.sub_model else lm
     dspy.configure(lm=lm)
 
-    # Select signature based on mode
-    sig = ComposeSession if args.mode == "session" else Compose
-
     print("=== DSPy RLM Composer ===")
-    print(f"  Mode:       {args.mode}")
     print(f"  Model:      {args.model}")
     print(f"  Sub-model:  {args.sub_model or args.model}")
     print(f"  Iterations: {args.max_iterations}")
@@ -1227,20 +951,19 @@ def main():
     print()
 
     if args.dry_run:
-        print(f"  [DRY RUN] Signature: {sig.__name__}")
-        print(f"  [DRY RUN] Docstring ({len(sig.__doc__)} chars):")
-        print(sig.__doc__[:300] + "...")
+        print(f"  [DRY RUN] Signature: {Compose.__name__}")
+        print(f"  [DRY RUN] Docstring ({len(Compose.__doc__)} chars):")
+        print(Compose.__doc__[:300] + "...")
         print("\n  [DRY RUN] Would connect to Ableton and run RLM. Exiting.")
         return
 
     # Connect to Ableton
     session = Session()
-    tools_by_mode = make_tools(session, min_clips=args.min_clips)
-    tools = tools_by_mode[args.mode]
+    tools = make_tools(session, min_clips=args.min_clips)
 
-    # Build RLM — signature docstring IS the prompt (highest priority)
+    # Build RLM — Compose signature docstring IS the prompt (highest priority)
     composer = dspy.RLM(
-        sig,
+        Compose,
         max_iterations=args.max_iterations,
         max_llm_calls=args.max_llm_calls,
         max_output_chars=15000,
