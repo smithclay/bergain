@@ -9,6 +9,7 @@ Usage:
     uv run python compose.py "Dark Berlin techno in F minor, 130 BPM, driving kick"
     uv run python compose.py --brief-file brief.txt
     uv run python compose.py --model openrouter/openai/gpt-5 "Dark ambient in Eb"
+    uv run python compose.py --live --duration 60 "Evolving ambient in F minor"
     uv run python compose.py --dry-run "Test brief"
 """
 
@@ -92,6 +93,67 @@ class Compose(dspy.Signature):
     report: str = dspy.OutputField(
         description="Summary of the session palette: tempo, tracks, scenes with slot numbers "
         "and energy levels and clip names, mix levels, key and chords per scene"
+    )
+
+
+class LiveCompose(dspy.Signature):
+    """You are a live composer performing in real time. Music plays while you
+    think. compose_next() is your main creative tool — give it FEELINGS and
+    DIRECTION, and a sub-LM handles all musical decisions (chords, styles,
+    energy values). You are the conductor, not the arranger.
+
+    WORKFLOW:
+      SETUP (one step): browse() + create_tracks() + set_tempo() + play()
+      EVOLVE (repeat): Call compose_next() with creative direction. It handles
+        everything: sub-LM query, clip writing, scene firing, waiting.
+        Check get_arc_summary() every ~5 sections to course-correct.
+      FINISH: When get_arc_summary() shows final phase, set_mix() +
+        ready_to_submit(), then SUBMIT(report) alone in the final step.
+
+    ENERGY ARC — think in thirds:
+      - Opening third: build gradually, stay low-to-moderate. Establish mood.
+      - Middle third: create WAVES — alternate lifts and dips. Most variety.
+      - Final third: wind down. Longer bars, sparser textures, gentle fade.
+      Never let energy plateau for more than 3 sections — if arc summary
+      shows a flat trend, force a contrast.
+
+    RULES:
+      - compose_next() takes a creative prompt, NOT parameter values.
+        Good: "Bring in a deep walking bass, let the drums rest"
+        Bad:  "energy 0.55, drums half_time, bass sustained"
+      - compose_next() tracks history and enforces variety automatically.
+      - Call get_arc_summary() to see energy curve, style stats, timing phase.
+      - ready_to_submit() enforces minimum elapsed time. Don't rush.
+      - Most tools return JSON (parse with json.loads). Exceptions: browse()
+        and get_status() return plain text.
+
+    EXAMPLE (each step = one code block, separate execution):
+      Step 1: browse("909", "Drums"); create_tracks(json.dumps([
+                {"name":"Drums","drum_kit":"909 Core Kit.adg"},
+                {"name":"Bass","instrument":"Operator"},
+                {"name":"Pad","sound":"Warm Pad"}])); set_tempo(128); play()
+      Step 2: print(compose_next("Open with atmosphere — just pads, no rhythm, "
+                "let the space breathe. Dreamy and mysterious."))
+      Step 3: print(compose_next("Introduce a gentle pulse — minimal drums, "
+                "maybe a soft bass note. Keep the energy low but add momentum."))
+      Step 4: print(compose_next("Build — more rhythmic drive, bring the bass "
+                "forward, add some chord movement."))
+      Step 5: arc = json.loads(get_arc_summary())
+              print(f"Phase: {arc['phase']}, trend: {arc['energy_trend']}")
+              # Adjust direction based on arc...
+              print(compose_next("We need contrast — drop to a quiet interlude, "
+                "strip away the drums, just pads and atmosphere."))
+      ...
+      Step N: set_mix(...); print(ready_to_submit())
+      Step N+1: SUBMIT(report)
+    """
+
+    brief: str = dspy.InputField(
+        description="Creative brief describing mood, genre, tempo, and target duration"
+    )
+    report: str = dspy.OutputField(
+        description="Summary of the live performance: tempo, tracks, sections composed "
+        "with timestamps and energy arc, total duration, key creative decisions"
     )
 
 
@@ -293,6 +355,41 @@ def _render_drums(bars, energy, style, section_name="x", beats_per_bar=4):
             if energy >= 0.4 and beat % (beats_per_bar * 2) == 3:
                 notes.append((_SNARE, float(beat), 0.5, v() - 20))
 
+    elif style == "shuffle":
+        # Swung triplet feel — kick on 1/3, hats on triplet grid
+        for beat in range(total_beats):
+            # Kick on 1 and 3
+            if beat % beats_per_bar in (0, 2):
+                notes.append((_KICK, float(beat), 0.5, v()))
+            # Swung hat triplets (straight + swing offset)
+            if energy >= 0.2:
+                notes.append((_CLOSED_HAT, float(beat), 0.2, v() - 20))
+                notes.append((_CLOSED_HAT, beat + 0.67, 0.2, v() - 28))
+            # Snare on 2 and 4 with ghost notes
+            if energy >= 0.3 and beat % beats_per_bar in (1, 3):
+                notes.append((_SNARE, float(beat), 0.5, v()))
+            if energy >= 0.5 and rng.random() < 0.3:
+                notes.append((_SNARE, beat + 0.67, 0.25, v() - 30))
+            # Open hat accents
+            if energy >= 0.6 and beat % beats_per_bar == 3 and rng.random() < 0.4:
+                notes.append((_OPEN_HAT, beat + 0.67, 0.3, v() - 15))
+
+    elif style == "sparse_perc":
+        # Percussion texture only — no kick, no snare. Ride, hats, perc.
+        for beat in range(total_beats):
+            # Ride as anchor
+            if beat % 2 == 0:
+                notes.append((_RIDE, float(beat), 0.5, v() - 15))
+            # Sporadic closed hat
+            if rng.random() < 0.25 * energy:
+                notes.append((_CLOSED_HAT, beat + rng.random() * 0.5, 0.2, v() - 25))
+            # Perc hits on offbeats
+            if energy >= 0.3 and rng.random() < 0.2:
+                notes.append((_PERC, beat + 0.5, 0.3, v() - 10))
+            # Open hat swells
+            if energy >= 0.4 and beat % (beats_per_bar * 2) == 0:
+                notes.append((_OPEN_HAT, float(beat), 0.5, v() - 20))
+
     return notes
 
 
@@ -371,6 +468,24 @@ def _render_bass(
                 notes.append((pitch, beat, 0.2, vel))
                 beat += 0.25
 
+        elif style == "walking":
+            # Jazz walking bass — quarter notes stepping through chord tones
+            # and chromatic passing tones
+            chord_pitches = [root_midi, root_midi + 3, root_midi + 7, root_midi + 5]
+            beat = chord_start
+            step_idx = 0
+            while beat < chord_end - 0.01:
+                base = chord_pitches[step_idx % len(chord_pitches)]
+                # Occasional chromatic approach from below
+                if rng.random() < 0.2 and step_idx > 0:
+                    base = chord_pitches[(step_idx + 1) % len(chord_pitches)] - 1
+                # Occasional octave jump at high energy
+                if energy >= 0.6 and rng.random() < 0.15:
+                    base += 12
+                notes.append((max(0, min(127, base)), beat, 0.9, v()))
+                beat += 1.0
+                step_idx += 1
+
     return notes
 
 
@@ -439,6 +554,32 @@ def _render_pads(
                     notes.append((p, beat, dur, v()))
                 beat += pulse
 
+        elif style == "arpeggiated":
+            # Broken chord arpeggios — 8th notes cycling through chord tones
+            beat = chord_start
+            idx = 0
+            step = 0.5  # 8th notes
+            while beat < chord_end - 0.01:
+                p = pitches[idx % len(pitches)]
+                vel = v()
+                # Accent first note of each beat
+                if abs(beat % 1.0) < 0.01:
+                    vel = min(127, vel + 10)
+                notes.append((p, beat, step * 0.9, vel))
+                beat += step
+                idx += 1
+
+        elif style == "swells":
+            # Crescendo/decrescendo pads — velocity ramps up then down
+            dur = beats_per_chord
+            mid = dur / 2.0
+            for p in pitches:
+                # Split into two notes: rising and falling velocity
+                vel_rise = max(1, min(127, base_vel - 20 + rng.randint(-5, 5)))
+                vel_peak = max(1, min(127, base_vel + 20 + rng.randint(-5, 5)))
+                notes.append((p, chord_start, mid, vel_rise))
+                notes.append((p, chord_start + mid, mid, vel_peak))
+
     return notes
 
 
@@ -447,7 +588,9 @@ def _render_pads(
 # ---------------------------------------------------------------------------
 
 
-def make_tools(session, min_clips=6):
+def make_tools(
+    session, min_clips=6, live_mode=False, duration_minutes=60, sub_lm=None, brief=""
+):
     """Create tool closures over a live Session, with milestone tracking."""
 
     # Milestone tracker — shared mutable state across all tool closures.
@@ -462,6 +605,12 @@ def make_tools(session, min_clips=6):
 
     # Track role map: {"TrackName": "drums"|"bass"|"pad"} — set by create_tracks()
     _track_roles = {}
+
+    # Live mode state — tracks elapsed time for wait/elapsed/ready_to_submit
+    _live_state = {"start_time": None, "target_duration": duration_minutes}
+
+    # Live mode history — compose_next() maintains this automatically
+    _live_history = []
 
     def set_tempo(bpm: int) -> str:
         """Set the project tempo in BPM."""
@@ -683,6 +832,8 @@ def make_tools(session, min_clips=6):
         """Start playback."""
         try:
             session.play()
+            if live_mode and _live_state["start_time"] is None:
+                _live_state["start_time"] = time.time()
             return json.dumps({"playing": True})
         except Exception as e:
             return json.dumps({"error": str(e)})
@@ -723,9 +874,9 @@ def make_tools(session, min_clips=6):
               energy (float): 0.0 (silent/sparse) to 1.0 (full power)
               chords (list[str]): Chord names, e.g. ["Fm", "Cm7"]
               key (str): Key root note, e.g. "F"
-              drums (str): "four_on_floor"|"half_time"|"breakbeat"|"minimal"|"none"
-              bass (str): "rolling_16th"|"offbeat_8th"|"pulsing_8th"|"sustained"|"none"
-              pad (str): "sustained"|"atmospheric"|"pulsing"|"none"
+              drums (str): "four_on_floor"|"half_time"|"breakbeat"|"minimal"|"shuffle"|"sparse_perc"|"none"
+              bass (str): "rolling_16th"|"offbeat_8th"|"pulsing_8th"|"sustained"|"walking"|"none"
+              pad (str): "sustained"|"atmospheric"|"pulsing"|"arpeggiated"|"swells"|"none"
 
         Creates looping session clips for each track role. Clips in the same
         slot (scene) can be fired together for instant transitions.
@@ -787,6 +938,439 @@ def make_tools(session, min_clips=6):
         except Exception as e:
             return json.dumps({"error": str(e)})
 
+    def _get_elapsed():
+        """Internal helper: return (elapsed_min, remaining_min) or None if not started."""
+        if _live_state["start_time"] is None:
+            return None
+        elapsed_sec = time.time() - _live_state["start_time"]
+        elapsed_min = elapsed_sec / 60.0
+        remaining_min = max(0.0, _live_state["target_duration"] - elapsed_min)
+        return elapsed_min, remaining_min
+
+    def wait(bars: int) -> str:
+        """Wait for a number of bars to play. Sleeps in real time based on current tempo.
+
+        Args:
+            bars: Number of bars to wait (e.g. 4 or 8)
+
+        Use after fire_scene() to let a section play before composing the next one.
+        Returns elapsed and remaining minutes.
+        """
+        try:
+            bpm = session.status().get("tempo", 120)
+            seconds = int(bars) * 4 * 60.0 / bpm
+            time.sleep(seconds)
+            info = _get_elapsed()
+            if info:
+                elapsed_min, remaining_min = info
+                return json.dumps(
+                    {
+                        "waited_bars": int(bars),
+                        "waited_seconds": round(seconds, 1),
+                        "elapsed_minutes": round(elapsed_min, 1),
+                        "remaining_minutes": round(remaining_min, 1),
+                    }
+                )
+            return json.dumps(
+                {"waited_bars": int(bars), "waited_seconds": round(seconds, 1)}
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def elapsed() -> str:
+        """Get elapsed and remaining time for the live performance.
+
+        Returns JSON with elapsed_minutes, remaining_minutes, target_minutes.
+        Call periodically to know when to wrap up.
+        """
+        info = _get_elapsed()
+        if info:
+            elapsed_min, remaining_min = info
+            return json.dumps(
+                {
+                    "elapsed_minutes": round(elapsed_min, 1),
+                    "remaining_minutes": round(remaining_min, 1),
+                    "target_minutes": _live_state["target_duration"],
+                }
+            )
+        return json.dumps(
+            {
+                "elapsed_minutes": 0,
+                "remaining_minutes": _live_state["target_duration"],
+                "target_minutes": _live_state["target_duration"],
+                "note": "Timer starts on first play() call",
+            }
+        )
+
+    def compose_next(creative_prompt: str) -> str:
+        """Compose and perform the next section in one step. The sub-LM makes
+        all musical decisions — you provide creative DIRECTION, not parameters.
+
+        Args:
+            creative_prompt: Describe the FEELING and DIRECTION you want.
+                Do NOT specify exact parameter values — let the sub-LM surprise you.
+                Good: "Build tension — bring in a driving bass, keep drums sparse"
+                Good: "Drop to a quiet interlude, just pads and atmosphere"
+                Good: "Peak energy, all instruments full power, complex rhythms"
+                Good: "Shift to a new key for freshness, walking bass, arpeggiated pad"
+                Bad:  "energy 0.58, drums half_time, bass sustained, key Eb"
+
+        Internally: calls sub-LM → writes clips → fires scene → waits.
+        History is tracked and compressed automatically.
+        Returns JSON summary of what was composed and performed.
+        """
+        try:
+            if sub_lm is None:
+                return json.dumps(
+                    {"error": "compose_next requires sub_lm (live mode only)"}
+                )
+
+            # Compressed history: last 5 full entries + summary of earlier
+            recent = _live_history[-5:]
+            earlier_summary = ""
+            if len(_live_history) > 5:
+                earlier = _live_history[:-5]
+                energies = [h["energy"] for h in earlier]
+                keys_used = sorted(set(h.get("key", "?") for h in earlier))
+                styles = set()
+                for h in earlier:
+                    styles.add(
+                        (h.get("drums", "?"), h.get("bass", "?"), h.get("pad", "?"))
+                    )
+                earlier_summary = (
+                    f"Earlier ({len(earlier)} sections): energy {min(energies):.2f}"
+                    f"-{max(energies):.2f}, keys: {'/'.join(keys_used)}, "
+                    f"{len(styles)} unique style combos.\n"
+                )
+
+            # Style combo frequency for variety enforcement
+            combo_counts = {}
+            for h in _live_history:
+                combo = (
+                    h.get("drums", "none"),
+                    h.get("bass", "none"),
+                    h.get("pad", "none"),
+                )
+                combo_counts[combo] = combo_counts.get(combo, 0) + 1
+            overused = [
+                f"{d}/{b}/{p}" for (d, b, p), c in combo_counts.items() if c >= 3
+            ]
+            variety_note = ""
+            if overused:
+                variety_note = (
+                    f"OVERUSED combos (pick something DIFFERENT): "
+                    f"{', '.join(overused)}.\n"
+                )
+
+            # Arc phase guidance
+            arc_phase = ""
+            info = _get_elapsed()
+            if info:
+                elapsed_min, remaining_min = info
+                total = _live_state["target_duration"]
+                if elapsed_min < total * 0.33:
+                    arc_phase = (
+                        f"OPENING third ({elapsed_min:.0f}/{total} min). "
+                        "Build gradually — energy should stay low-to-moderate (0.1-0.5). "
+                        "8-16 bar loops let mood settle in.\n"
+                    )
+                elif elapsed_min < total * 0.66:
+                    arc_phase = (
+                        f"MIDDLE third ({elapsed_min:.0f}/{total} min). "
+                        "Create waves — alternate between lifts and dips (0.3-0.8). "
+                        "This is where the most variety belongs. "
+                        "4-bar loops for peaks, 8-bar for dips.\n"
+                    )
+                else:
+                    arc_phase = (
+                        f"FINAL third ({elapsed_min:.0f}/{total} min). "
+                        "Begin winding down — energy should generally descend (0.5-0.1). "
+                        "16-bar loops for hypnotic fade, sparser textures.\n"
+                    )
+
+            # Breakdown nudge: if energy sustained high without a valley, suggest one
+            breakdown_nudge = ""
+            if len(_live_history) >= 3:
+                recent_3 = _live_history[-3:]
+                sustained_high = all(h["energy"] >= 0.6 for h in recent_3)
+                recent_has_breakdown = any(
+                    h.get("bass") == "none" for h in _live_history[-4:]
+                )
+                if sustained_high and not recent_has_breakdown:
+                    breakdown_nudge = (
+                        "Consider a breakdown — sustained high energy needs "
+                        "a valley to rebuild from.\n"
+                    )
+
+            next_slot = max((h["slot"] for h in _live_history), default=-1) + 1
+
+            prompt = (
+                f"You are composing the next section of a live performance.\n"
+                f"Brief: {brief}\n"
+                f"{arc_phase}"
+                f"{earlier_summary}"
+                f"Recent sections: {json.dumps(recent)}\n"
+                f"{variety_note}"
+                f"{breakdown_nudge}"
+                f"Creative direction: {creative_prompt}\n\n"
+                f"Return a single JSON object with these fields:\n"
+                f"  name (str): evocative section name\n"
+                f"  slot (int): use {next_slot}\n"
+                f"  bars (int): 4, 8, 16, or 32\n"
+                f"  energy (float): 0.0 to 1.0 — calibration: 0.2=ambient, "
+                f"0.4=gentle groove, 0.6=driving, 0.8=peak power, 0.95=maximum\n"
+                f"  key (str): root note like 'F', 'Eb', 'Ab'\n"
+                f"  chords (list[str]): 2-4 chord names like 'Fm7', 'Abmaj9'\n"
+                f"  drums: 'four_on_floor'|'half_time'|'breakbeat'|'minimal'|"
+                f"'shuffle'|'sparse_perc'|'none'\n"
+                f"  bass: 'rolling_16th'|'offbeat_8th'|'pulsing_8th'|'sustained'|"
+                f"'walking'|'none'\n"
+                f"  pad: 'sustained'|'atmospheric'|'pulsing'|'arpeggiated'|"
+                f"'swells'|'none'\n\n"
+                f"Make bold creative choices that serve the direction. "
+                f"Respond with ONLY the JSON object."
+            )
+
+            completions = sub_lm(messages=[{"role": "user", "content": prompt}])
+            raw = completions[0] if completions else ""
+            # sub_lm returns dicts with 'text' key — normalise to string
+            if isinstance(raw, dict):
+                response_text = raw.get("text") or raw.get("content") or str(raw)
+            else:
+                response_text = str(raw)
+
+            m = re.search(r"\{.*\}", response_text, re.S)
+            if not m:
+                return json.dumps(
+                    {
+                        "error": "Sub-LM returned no valid JSON",
+                        "raw": response_text[:500],
+                    }
+                )
+            section = json.loads(m.group())
+
+            # Validate and clamp
+            section.setdefault("slot", next_slot)
+            section["slot"] = int(section["slot"])
+            section.setdefault("bars", 8)
+            section["bars"] = int(section["bars"])
+            section.setdefault("energy", 0.5)
+            section["energy"] = max(0.0, min(1.0, float(section["energy"])))
+
+            # Energy guardrails: nudge sub-LM output toward arc-appropriate range
+            if info:
+                elapsed_min, _ = info
+                total = _live_state["target_duration"]
+                if elapsed_min < total * 0.33:
+                    # Opening: allow 0.05–0.55
+                    section["energy"] = max(0.05, min(0.55, section["energy"]))
+                elif elapsed_min < total * 0.66:
+                    # Middle: boost floor to 0.3 so peaks actually peak
+                    section["energy"] = max(0.3, section["energy"])
+                    # High-energy middle sections: cap bars at 8 for tighter loops
+                    if section["energy"] >= 0.6:
+                        section["bars"] = min(section["bars"], 8)
+                # Final: no override, let it wind down naturally
+            section.setdefault("key", "C")
+            section.setdefault("chords", [section["key"] + "m7"])
+            section.setdefault("drums", "none")
+            section.setdefault("bass", "none")
+            section.setdefault("pad", "sustained")
+            section.setdefault("name", f"Section {section['slot']}")
+
+            clip_result = write_clip(json.dumps(section))
+            clip_info = json.loads(clip_result)
+            if "error" in clip_info:
+                return clip_result
+
+            # Transition fades: fade out tracks that go from active to "none"
+            fade_tracks = []
+            if _live_history:
+                prev = _live_history[-1]
+                role_to_style = {"drums": "drums", "bass": "bass", "pad": "pad"}
+                for track_name, role in _track_roles.items():
+                    style_key = role_to_style.get(role)
+                    if not style_key:
+                        continue
+                    was_active = prev.get(style_key, "none") != "none"
+                    now_silent = section.get(style_key, "none") == "none"
+                    if was_active and now_silent:
+                        try:
+                            session.fade(track_name, 0.0, steps=4, duration=0.5)
+                            fade_tracks.append(track_name)
+                        except Exception:
+                            pass
+
+            fire_scene(section["slot"])
+
+            # Restore faded tracks to default volume after scene fires
+            for track_name in fade_tracks:
+                try:
+                    session.fade(track_name, 0.85, steps=4, duration=0.5)
+                except Exception:
+                    pass
+
+            wait_result = wait(section["bars"])
+            wait_info = json.loads(wait_result)
+
+            # Texture density: fraction of instruments active (0.0-1.0)
+            styles = [
+                section.get("drums", "none"),
+                section.get("bass", "none"),
+                section.get("pad", "none"),
+            ]
+            density = sum(1 for s in styles if s != "none") / len(styles)
+
+            _live_history.append(
+                {
+                    "section": section["name"],
+                    "slot": section["slot"],
+                    "energy": section["energy"],
+                    "density": round(density, 2),
+                    "key": section["key"],
+                    "chords": section.get("chords", [])[:4],
+                    "drums": section.get("drums", "none"),
+                    "bass": section.get("bass", "none"),
+                    "pad": section.get("pad", "none"),
+                }
+            )
+
+            return json.dumps(
+                {
+                    "composed": section["name"],
+                    "slot": section["slot"],
+                    "energy": section["energy"],
+                    "key": section["key"],
+                    "chords": section.get("chords", []),
+                    "style": (
+                        f"{section.get('drums', 'none')}/"
+                        f"{section.get('bass', 'none')}/"
+                        f"{section.get('pad', 'none')}"
+                    ),
+                    "bars": section["bars"],
+                    "clips_created": clip_info.get("clips_created", 0),
+                    "elapsed_minutes": wait_info.get("elapsed_minutes"),
+                    "remaining_minutes": wait_info.get("remaining_minutes"),
+                    "sections_so_far": len(_live_history),
+                }
+            )
+        except Exception as e:
+            return json.dumps({"error": str(e)})
+
+    def get_arc_summary() -> str:
+        """Get a summary of the performance arc so far.
+
+        Returns energy curve, style combo stats, time phase, and variety metrics.
+        Use this to understand where you are and what to do next.
+        """
+        if not _live_history:
+            return json.dumps({"sections": 0, "note": "No sections composed yet"})
+
+        energies = [h["energy"] for h in _live_history]
+        densities = [h.get("density", 0.33) for h in _live_history]
+        keys_used = {}
+        combo_counts = {}
+        for h in _live_history:
+            k = h.get("key", "?")
+            keys_used[k] = keys_used.get(k, 0) + 1
+            combo = (h.get("drums", "?"), h.get("bass", "?"), h.get("pad", "?"))
+            combo_counts[combo] = combo_counts.get(combo, 0) + 1
+
+        # Energy bands
+        bands = {"low (0-0.3)": 0, "mid (0.3-0.6)": 0, "high (0.6-1.0)": 0}
+        for e in energies:
+            if e < 0.3:
+                bands["low (0-0.3)"] += 1
+            elif e < 0.6:
+                bands["mid (0.3-0.6)"] += 1
+            else:
+                bands["high (0.6-1.0)"] += 1
+
+        # Recent energy trend (last 5)
+        recent_energies = energies[-5:]
+        trend = "flat"
+        if len(recent_energies) >= 3:
+            diffs = [
+                recent_energies[i + 1] - recent_energies[i]
+                for i in range(len(recent_energies) - 1)
+            ]
+            avg_diff = sum(diffs) / len(diffs)
+            if avg_diff > 0.03:
+                trend = "rising"
+            elif avg_diff < -0.03:
+                trend = "falling"
+
+        # Contrast between adjacent sections
+        contrasts = []
+        for i in range(1, len(_live_history)):
+            prev, curr = _live_history[i - 1], _live_history[i]
+            energy_delta = abs(curr["energy"] - prev["energy"])
+            style_changes = sum(
+                1
+                for k in ("drums", "bass", "pad")
+                if curr.get(k, "none") != prev.get(k, "none")
+            )
+            contrasts.append(energy_delta + style_changes * 0.1)
+
+        avg_contrast = round(sum(contrasts) / len(contrasts), 2) if contrasts else 0.0
+        # Flag monotony: low energy delta AND same instruments for 3+ sections
+        low_contrast_warning = None
+        if len(_live_history) >= 3:
+            tail = _live_history[-3:]
+            tail_energy_deltas = [
+                abs(tail[i]["energy"] - tail[i - 1]["energy"])
+                for i in range(1, len(tail))
+            ]
+            tail_style_same = all(
+                tail[i].get(k) == tail[0].get(k)
+                for i in range(1, len(tail))
+                for k in ("drums", "bass", "pad")
+            )
+            if max(tail_energy_deltas) < 0.1 and tail_style_same:
+                low_contrast_warning = (
+                    "Low contrast for 3+ sections — risk of monotony. "
+                    "Change instruments or make a bigger energy shift."
+                )
+
+        result = {
+            "sections": len(_live_history),
+            "energy_range": [round(min(energies), 2), round(max(energies), 2)],
+            "energy_avg": round(sum(energies) / len(energies), 2),
+            "energy_trend": trend,
+            "energy_bands": bands,
+            "density_avg": round(sum(densities) / len(densities), 2),
+            "density_current": densities[-1],
+            "avg_contrast": avg_contrast,
+            "keys_used": keys_used,
+            "unique_style_combos": len(combo_counts),
+            "most_used_combos": [
+                {"style": f"{d}/{b}/{p}", "count": c}
+                for (d, b, p), c in sorted(combo_counts.items(), key=lambda x: -x[1])[
+                    :5
+                ]
+            ],
+        }
+
+        if low_contrast_warning:
+            result["warning"] = low_contrast_warning
+
+        info = _get_elapsed()
+        if info:
+            elapsed_min, remaining_min = info
+            total = _live_state["target_duration"]
+            result["elapsed_minutes"] = round(elapsed_min, 1)
+            result["remaining_minutes"] = round(remaining_min, 1)
+            phase = (
+                "opening"
+                if elapsed_min < total * 0.33
+                else "middle"
+                if elapsed_min < total * 0.66
+                else "final"
+            )
+            result["phase"] = phase
+
+        return json.dumps(result)
+
     def ready_to_submit() -> str:
         """Check if composition is complete enough to SUBMIT.
 
@@ -803,17 +1387,30 @@ def make_tools(session, min_clips=6):
             issues.append(
                 f"only {_done['clips']} clips created (need at least {min_clips}) — build more scenes"
             )
-        if not _done["mix"]:
-            issues.append("set_mix() not called — balance volumes and panning")
-        if _done["status_checks"] < 1:
-            issues.append(
-                "get_status() never called — verify your work before submitting"
-            )
+        if live_mode:
+            # In live mode: check elapsed time instead of mix requirement
+            info = _get_elapsed()
+            if info:
+                elapsed_min, _ = info
+                threshold = _live_state["target_duration"] * 0.8
+                if elapsed_min < threshold:
+                    issues.append(
+                        f"only {elapsed_min:.1f} min elapsed (need ~{threshold:.0f} min) — keep evolving"
+                    )
+            else:
+                issues.append("play() not called yet — start playback first")
+        else:
+            if not _done["mix"]:
+                issues.append("set_mix() not called — balance volumes and panning")
+            if _done["status_checks"] < 1:
+                issues.append(
+                    "get_status() never called — verify your work before submitting"
+                )
         if issues:
             return "NOT READY to submit:\n" + "\n".join(f"  - {i}" for i in issues)
         return "READY — call SUBMIT(report) in the NEXT step (no other tool calls)."
 
-    return [
+    tools = [
         set_tempo,
         get_status,
         create_tracks,
@@ -833,6 +1430,9 @@ def make_tools(session, min_clips=6):
         write_clip,
         ready_to_submit,
     ]
+    if live_mode:
+        tools.extend([wait, elapsed, compose_next, get_arc_summary])
+    return tools
 
 
 # ---------------------------------------------------------------------------
@@ -915,6 +1515,17 @@ def parse_args():
         help="Minimum clips before ready_to_submit() allows SUBMIT",
     )
     p.add_argument(
+        "--live",
+        action="store_true",
+        help="Live composition mode — RLM composes in real time while music plays",
+    )
+    p.add_argument(
+        "--duration",
+        type=int,
+        default=60,
+        help="Target duration in minutes for live mode (default: 60)",
+    )
+    p.add_argument(
         "--dry-run",
         action="store_true",
         help="Print config and tools, don't connect to Ableton",
@@ -935,12 +1546,26 @@ def main():
         print("Error: provide a brief as argument or via --brief-file")
         return
 
+    # Live mode defaults — bump iteration/call budgets if user didn't set them
+    if args.live:
+        if "--max-iterations" not in " ".join(os.sys.argv):
+            args.max_iterations = 60
+        if "--max-llm-calls" not in " ".join(os.sys.argv):
+            args.max_llm_calls = 60
+        if "--min-clips" not in " ".join(os.sys.argv):
+            args.min_clips = 3
+
+    # Pick signature
+    signature = LiveCompose if args.live else Compose
+    mode_label = f"LIVE ({args.duration} min)" if args.live else "PALETTE"
+
     # Configure LMs (cache=False to prevent stale trajectory replay)
     lm = dspy.LM(args.model, cache=False)
     sub_lm = dspy.LM(args.sub_model, cache=False) if args.sub_model else lm
     dspy.configure(lm=lm)
 
     print("=== DSPy RLM Composer ===")
+    print(f"  Mode:       {mode_label}")
     print(f"  Model:      {args.model}")
     print(f"  Sub-model:  {args.sub_model or args.model}")
     print(f"  Iterations: {args.max_iterations}")
@@ -951,19 +1576,26 @@ def main():
     print()
 
     if args.dry_run:
-        print(f"  [DRY RUN] Signature: {Compose.__name__}")
-        print(f"  [DRY RUN] Docstring ({len(Compose.__doc__)} chars):")
-        print(Compose.__doc__[:300] + "...")
+        print(f"  [DRY RUN] Signature: {signature.__name__}")
+        print(f"  [DRY RUN] Docstring ({len(signature.__doc__)} chars):")
+        print(signature.__doc__[:300] + "...")
         print("\n  [DRY RUN] Would connect to Ableton and run RLM. Exiting.")
         return
 
     # Connect to Ableton
     session = Session()
-    tools = make_tools(session, min_clips=args.min_clips)
+    tools = make_tools(
+        session,
+        min_clips=args.min_clips,
+        live_mode=args.live,
+        duration_minutes=args.duration,
+        sub_lm=sub_lm if args.live else None,
+        brief=brief,
+    )
 
-    # Build RLM — Compose signature docstring IS the prompt (highest priority)
+    # Build RLM — signature docstring IS the prompt (highest priority)
     composer = dspy.RLM(
-        Compose,
+        signature,
         max_iterations=args.max_iterations,
         max_llm_calls=args.max_llm_calls,
         max_output_chars=15000,
