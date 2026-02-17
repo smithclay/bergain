@@ -11,3 +11,10 @@ dependencies = [
     "dspy>=2.6",
     "python-dotenv>=1.0",
 ]
+
+[project.scripts]
+bergain = "bergain.compose:main"
+bergain-browse = "bergain.browse:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

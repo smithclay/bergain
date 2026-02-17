@@ -11,9 +11,7 @@ import threading
 import time
 from pythonosc.osc_message_builder import OscMessageBuilder
 from pythonosc.osc_message import OscMessage
-from spec_data import spec as _ableton_spec
-
-import requests
+from .spec_data import spec as _ableton_spec
 
 REMOTE_PORT = 11000
 LOCAL_PORT = 11001
@@ -290,6 +288,8 @@ def analyze_audio(
     file_path_2: str | None = None,
 ) -> dict:
     """Send audio to the Modal Analyzer endpoint and return results."""
+    import requests
+
     files = {}
     handles = []
     try:
@@ -340,7 +340,7 @@ def main():
     cmd = sys.argv[1]
 
     if cmd == "info":
-        from session import Session
+        from .session import Session
 
         s = Session()
         s.info()

@@ -3,7 +3,7 @@
 Built by extracting every add_handler call from the AbletonOSC handler source files.
 """
 
-from spec import ParamSpec, EndpointSpec, DomainSpec, AbletonOSCSpec
+from .spec import ParamSpec, EndpointSpec, DomainSpec, AbletonOSCSpec
 
 
 # =============================================================================

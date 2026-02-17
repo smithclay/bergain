@@ -2,16 +2,12 @@
 
 Session wraps LiveAPI with track-name resolution, device-param caching,
 and convenience methods for the live DJ workflow.
-
-Set / Track / Scene provide the composition workflow for building
-arrangements and session clips.
 """
 
 import time
-from collections.abc import Callable
 from dataclasses import dataclass, field
 
-from main import LiveAPI, REMOTE_PORT, LOCAL_PORT
+from .osc import LiveAPI, REMOTE_PORT, LOCAL_PORT
 
 
 def _notes_to_wire(tuples):
@@ -20,20 +16,6 @@ def _notes_to_wire(tuples):
     for p, s, d, v in tuples:
         flat.extend([p, float(s), float(d), v, 0])
     return flat
-
-
-def make_automation(changes):
-    """Create an on_enter hook that sets device parameters.
-
-    changes: list of (track_name, device_index, param_name, value, description)
-    """
-
-    def on_enter(session):
-        for track_name, device, param_name, val, desc in changes:
-            session.param(track_name, device, param_name, val)
-            print(f"      [{desc}]")
-
-    return on_enter
 
 
 class Session:
@@ -510,11 +492,6 @@ class Session:
         self.api.stop()
 
 
-# ---------------------------------------------------------------------------
-# Composition workflow: Set / Track / Scene
-# ---------------------------------------------------------------------------
-
-
 @dataclass
 class Track:
     """Declares a track's instrument, effects, and mix."""
@@ -526,154 +503,3 @@ class Track:
     effects: list[str] = field(default_factory=list)
     volume: float = 0.85
     pan: float = 0.0
-
-
-@dataclass
-class Scene:
-    """A row of clips across tracks."""
-
-    name: str
-    bars: int
-    clips: dict[str, Callable]
-    on_enter: Callable | None = None
-
-
-def _format_duration(seconds):
-    """Format seconds as 'N min' or 'Ns'."""
-    if seconds >= 120:
-        return f"{seconds / 60:.0f} min"
-    return f"{seconds:.0f}s"
-
-
-class Set:
-    """A persistent session with tracks/effects/mix — Ableton's 'Live Set'.
-
-    Usage:
-        s = Set("My Set", bpm=120, tracks=[...])
-        s.setup()
-        s.load_scenes(scenes)
-        s.build_arrangement(scenes)
-        s.play()
-        s.teardown()
-    """
-
-    def __init__(
-        self,
-        name,
-        bpm,
-        tracks,
-        beats_per_bar=4,
-        groove=0.0,
-        metronome=False,
-        time_sig=None,
-        subtitle=None,
-        api=None,
-    ):
-        self.name = name
-        self.subtitle = subtitle
-        self.bpm = bpm
-        self.tracks = tracks
-        self.beats_per_bar = beats_per_bar
-        self.groove = groove
-        self.metronome = metronome
-        self.time_sig = time_sig
-        self._api = api
-        self.session = None
-        self._scenes = []
-
-    def setup(self):
-        """Connect to Ableton, create tracks, load instruments/effects, set mix."""
-        self.session = Session(api=self._api)
-        self.session.stop()
-        time.sleep(0.2)
-
-        print(f"=== {self.name.upper()} ===")
-        if self.subtitle:
-            print(f"=== {self.subtitle} ===")
-        print()
-
-        self.session.tempo(self.bpm)
-        self.session.api.song.set("groove_amount", self.groove)
-        self.session.api.song.set("metronome", self.metronome)
-
-        if self.time_sig:
-            try:
-                self.session.api.song.set("signature_numerator", self.time_sig[0])
-                self.session.api.song.set("signature_denominator", self.time_sig[1])
-            except Exception:
-                pass
-
-        sig = f", {self.time_sig[0]}/{self.time_sig[1]}" if self.time_sig else ""
-        print(f"  {self.bpm} BPM{sig}\n")
-
-        self.session.setup(self.tracks)
-
-    def load_scenes(self, scenes):
-        """Create session clips from scenes."""
-        self._scenes = scenes
-        print("\n  Session clips:")
-        for scene_idx, scene in enumerate(scenes):
-            clip_beats = scene.bars * self.beats_per_bar
-            for track_name, fn in scene.clips.items():
-                clip_name = f"{scene.name} {track_name}"
-                self.session.clip(
-                    track_name, scene_idx, clip_beats, fn(scene.bars), clip_name
-                )
-            self.session.api.scene(scene_idx).set("name", scene.name)
-
-    def build_arrangement(self, scenes):
-        """Create arrangement clips from scenes, laid out linearly."""
-        self._scenes = scenes
-        self.session.clear_arrangement()
-        total_bars = sum(s.bars for s in scenes)
-        total_secs = total_bars * self.beats_per_bar * 60.0 / self.bpm
-        print(f"\n  Arrangement ({total_bars} bars, {_format_duration(total_secs)}):")
-
-        beat_offset = 0
-        for scene in scenes:
-            sec_beats = scene.bars * self.beats_per_bar
-            bar_start = beat_offset // self.beats_per_bar + 1
-            bar_end = bar_start + scene.bars - 1
-            active = " ".join(
-                "X" if t.name in scene.clips else "." for t in self.tracks
-            )
-            print(f"    {scene.name:20s} bars {bar_start:3d}-{bar_end:3d}  [{active}]")
-
-            for track_name, fn in scene.clips.items():
-                clip_name = f"{scene.name} {track_name}"
-                self.session.arr_clip(
-                    track_name, beat_offset, sec_beats, fn(scene.bars), clip_name
-                )
-            beat_offset += sec_beats
-
-        self.session.arrangement()
-
-    def play(self, scenes=None):
-        """Play arrangement linearly, calling on_enter hooks per scene."""
-        scenes = scenes or self._scenes
-        bar_dur = self.beats_per_bar * 60.0 / self.bpm
-        total_bars = sum(s.bars for s in scenes)
-        total_secs = total_bars * bar_dur
-        print(f"\n  Playing... ({_format_duration(total_secs)})")
-        self.session.seek(0)
-        time.sleep(0.1)
-        self.session.play()
-
-        try:
-            for scene in scenes:
-                if scene.on_enter:
-                    scene.on_enter(self.session)
-                secs = scene.bars * bar_dur
-                print(
-                    f"    >>> {scene.name} ({scene.bars} bars, {_format_duration(secs)})"
-                )
-                time.sleep(secs)
-        except KeyboardInterrupt:
-            pass
-
-        self.session.stop()
-
-    def teardown(self):
-        """Stop playback + disconnect."""
-        self.session.stop()
-        self.session.close()

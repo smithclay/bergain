@@ -4,3 +4,5 @@ __pycache__/
 .env
 .DS_Store
 output/
+.ruff_cache
+.pytest_cache
