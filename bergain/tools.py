@@ -50,6 +50,10 @@ def make_tools(
             try:
                 return fn(*args, **kwargs)
             except Exception as e:
+                import traceback
+
+                print(f"  [TOOL ERROR] {fn.__name__}: {type(e).__name__}: {e}")
+                traceback.print_exc()
                 return json.dumps({"error": str(e)})
 
         return wrapper
@@ -63,8 +67,8 @@ def make_tools(
     def get_status() -> str:
         """Get current DAW state as plain text. Returns tempo, playing status, and track list."""
         try:
-            _done["status_checks"] += 1
             s = session.status()
+            _done["status_checks"] += 1  # count only successful checks
             lines = [
                 f"Tempo: {s['tempo']} BPM",
                 f"Playing: {'yes' if s.get('playing') else 'no'}",
@@ -119,12 +123,29 @@ def make_tools(
                 )
             )
             # Auto-detect track role for write_clip()
+            # Only drums/bass/pad roles get clips — extra tracks (lead, fx, etc.)
+            # are left unassigned so write_clip() skips them.
+            name_lower = s["name"].lower()
             if s.get("drum_kit"):
                 _track_roles[s["name"]] = "drums"
-            elif "bass" in s["name"].lower():
+            elif "bass" in name_lower:
                 _track_roles[s["name"]] = "bass"
-            else:
+            elif any(
+                kw in name_lower for kw in ("pad", "chord", "keys", "synth", "string")
+            ):
                 _track_roles[s["name"]] = "pad"
+            elif any(kw in name_lower for kw in ("stab", "lead")):
+                _track_roles[s["name"]] = "stab"
+            elif any(kw in name_lower for kw in ("texture", "fx", "noise", "atmo")):
+                _track_roles[s["name"]] = "texture"
+
+        # Fallback: if no pad track was explicitly matched, assign the first
+        # unmatched track so write_clip() has somewhere to put chords/pads.
+        if "pad" not in _track_roles.values():
+            for s in specs:
+                if s["name"] not in _track_roles:
+                    _track_roles[s["name"]] = "pad"
+                    break
         count = session.setup(tracks)
         return json.dumps({"tracks_created": count, "names": [t.name for t in tracks]})
 
@@ -140,6 +161,12 @@ def make_tools(
         Returns NO_RESULTS if nothing matches — try broader terms.
         Example: browse("909", "Drums") might return "909 Core Kit.adg\\nClap 909.aif\\n..."
         Parse with: names = result.split('\\n')
+
+        IMPORTANT:
+          - For drum kits, pick .adg files (drum racks), NOT .wav/.aif (individual samples).
+            A sample like "Clap 909.aif" is a single hit, not a playable kit.
+          - Native Live devices (EQ Eight, Saturator, Auto Filter, etc.) do NOT appear
+            in search results. Load them by exact name with load_effect() — no browse needed.
         """
         _done["browse"] = True
         results = session.browse(query, category=category or None)
@@ -217,6 +244,164 @@ def make_tools(
             _live_state["start_time"] = time.time()
         return json.dumps({"playing": True})
 
+    # Known-good single-keyword fallbacks per role.
+    # Multi-word descriptive queries fail Ableton's browser consistently;
+    # these single keywords always return results.
+    _ROLE_SEARCH_FALLBACKS = {
+        "drums": [("Core Kit", "Drums"), ("909", "Drums"), ("kit", "Drums")],
+        "bass": [("acid bass", "Sounds"), ("sub bass", "Sounds"), ("bass", "Sounds")],
+        "pad": [("pad", "Sounds")],
+        "stab": [("stab", "Sounds"), ("pluck", "Sounds"), ("chord", "Sounds")],
+        "texture": [("noise", "Sounds"), ("texture", "Sounds"), ("metal", "Sounds")],
+    }
+
+    def _browse_cascade(search_term, role):
+        """Cascade through search attempts until something works.
+
+        Order: full search_term → individual tokens → role fallbacks.
+        Returns (sound, drum_kit) — one will be set, or both None.
+        """
+        is_drums = role == "drums"
+        category = "Drums" if is_drums else "Sounds"
+
+        def _pick(names):
+            """Pick best match from a list of result names."""
+            if is_drums:
+                adg = next((n for n in names if n.endswith(".adg")), None)
+                return (None, adg or names[0]) if names else (None, None)
+            else:
+                adv = next((n for n in names if n.endswith(".adv")), None)
+                adg = next((n for n in names if n.endswith(".adg")), None)
+                return (adv or adg or (names[0] if names else None), None)
+
+        # 1. Try the full search term
+        if search_term:
+            results = session.browse(search_term, category=category)
+            names = [r["name"] for r in results[:20]]
+            if names:
+                sound, drum_kit = _pick(names)
+                if sound or drum_kit:
+                    return sound, drum_kit, f"'{search_term}'"
+
+            # 2. Tokenize and try each word individually
+            tokens = search_term.split()
+            if len(tokens) > 1:
+                for token in tokens:
+                    results = session.browse(token, category=category)
+                    names = [r["name"] for r in results[:20]]
+                    if names:
+                        sound, drum_kit = _pick(names)
+                        if sound or drum_kit:
+                            return sound, drum_kit, f"token '{token}'"
+
+        # 3. Role-based fallbacks (known-good terms)
+        for fallback_term, fallback_cat in _ROLE_SEARCH_FALLBACKS.get(role, []):
+            results = session.browse(fallback_term, category=fallback_cat)
+            names = [r["name"] for r in results[:20]]
+            if names:
+                sound, drum_kit = _pick(names)
+                if sound or drum_kit:
+                    return sound, drum_kit, f"fallback '{fallback_term}'"
+
+        return None, None, "no results"
+
+    # Default effects per track role
+    _DEFAULT_EFFECTS = {
+        "drums": ["Drum Buss", "EQ Eight"],
+        "bass": ["Saturator", "EQ Eight"],
+        "pad": ["Auto Filter", "Reverb"],
+        "stab": ["Saturator", "Auto Filter"],
+        "texture": ["Reverb", "Auto Filter"],
+    }
+
+    @_json_tool
+    def setup_session(config_json: str) -> str:
+        """Set up the entire session in one call: create tracks, load sounds, set tempo, start playing.
+
+        Uses cascading search: tries your search term, then individual words,
+        then known-good fallbacks per role. Always creates every track — an
+        empty MIDI track is better than no track.
+
+        Args:
+            config_json: JSON object with:
+              tempo (int): BPM
+              tracks (list): each with:
+                name (str): Track name
+                role (str): "drums"|"bass"|"pad"|"stab"|"texture"
+                search (str, optional): Browser query — omit to use role defaults
+                effects (list[str], optional): Effect names — defaults applied per role if omitted
+
+        Example: json.dumps({
+            "tempo": 130,
+            "tracks": [
+                {"name": "Drums", "role": "drums"},
+                {"name": "Bass", "role": "bass"},
+                {"name": "Pad", "role": "pad"},
+                {"name": "Stab", "role": "stab"},
+                {"name": "Texture", "role": "texture"}
+            ]
+        })
+
+        ONE call replaces browse + create_tracks + set_tempo + play.
+        """
+        from .session import Track
+
+        config = json.loads(config_json)
+        tempo = config.get("tempo", 120)
+        track_specs = config.get("tracks", [])
+
+        tracks = []
+        _track_roles.clear()
+        load_log = []
+
+        for spec in track_specs:
+            name = spec["name"]
+            role = spec.get("role", "pad")
+            search_term = spec.get("search", "")
+            effects = spec.get("effects", _DEFAULT_EFFECTS.get(role, []))
+
+            # Cascading search: full term → tokens → role fallbacks
+            sound, drum_kit, matched_via = _browse_cascade(search_term, role)
+
+            if drum_kit:
+                load_log.append(f"{name}: drum kit '{drum_kit}' via {matched_via}")
+            elif sound:
+                load_log.append(f"{name}: sound '{sound}' via {matched_via}")
+            else:
+                load_log.append(f"{name}: empty MIDI track (no results)")
+
+            tracks.append(
+                Track(
+                    name=name,
+                    sound=sound,
+                    instrument=None,
+                    drum_kit=drum_kit,
+                    effects=effects,
+                    volume=spec.get("volume", 0.85),
+                    pan=spec.get("pan", 0.0),
+                )
+            )
+            _track_roles[name] = role
+
+        count = session.setup(tracks)
+        session.tempo(int(tempo))
+        session.play()
+
+        _done["browse"] = True
+        _done["tracks"] = True
+        if _live_state["start_time"] is None:
+            _live_state["start_time"] = time.time()
+
+        return json.dumps(
+            {
+                "tracks_created": count,
+                "tempo": tempo,
+                "playing": True,
+                "roles": {name: role for name, role in _track_roles.items()},
+                "loaded": load_log,
+            }
+        )
+
     @_json_tool
     def stop() -> str:
         """Stop playback."""
@@ -251,6 +436,8 @@ def make_tools(
               drums (str): "four_on_floor"|"half_time"|"breakbeat"|"minimal"|"shuffle"|"sparse_perc"|"none"
               bass (str): "rolling_16th"|"offbeat_8th"|"pulsing_8th"|"sustained"|"walking"|"none"
               pad (str): "sustained"|"atmospheric"|"pulsing"|"arpeggiated"|"swells"|"none"
+              stab (str): "sustained"|"atmospheric"|"pulsing"|"arpeggiated"|"swells"|"none"
+              texture (str): "sustained"|"atmospheric"|"pulsing"|"arpeggiated"|"swells"|"none"
 
         Creates looping session clips for each track role. Clips in the same
         slot (scene) can be fired together for instant transitions.
@@ -266,6 +453,8 @@ def make_tools(
         drum_style = c.get("drums", "none")
         bass_style = c.get("bass", "none")
         pad_style = c.get("pad", "none")
+        stab_style = c.get("stab", "none")
+        texture_style = c.get("texture", "none")
         length_beats = float(bars * 4)
 
         clips_created = 0
@@ -288,6 +477,33 @@ def make_tools(
                     bars, energy, pad_style, chords, key_root, section_name=name
                 )
                 clip_name = f"Pad {name}"
+            elif role == "stab" and stab_style != "none":
+                notes = render_pads(
+                    bars,
+                    energy,
+                    stab_style,
+                    chords,
+                    key_root,
+                    section_name=f"Stab {name}",
+                )
+                # Post-process: pitch +12, duration *0.5, velocity +15
+                notes = [
+                    (min(127, p + 12), s, d * 0.5, min(127, v + 15))
+                    for p, s, d, v in notes
+                ]
+                clip_name = f"Stab {name}"
+            elif role == "texture" and texture_style != "none":
+                notes = render_pads(
+                    bars,
+                    energy,
+                    texture_style,
+                    chords,
+                    key_root,
+                    section_name=f"Texture {name}",
+                )
+                # Post-process: pitch -12 (floor 0), velocity -20
+                notes = [(max(0, p - 12), s, d, max(1, v - 20)) for p, s, d, v in notes]
+                clip_name = f"Texture {name}"
 
             if notes:
                 clamped = [clamp_note(n) for n in notes]
@@ -373,6 +589,26 @@ def make_tools(
     # compose_next — split into helpers for readability
     # -------------------------------------------------------------------
 
+    # Keys safe to embed in sub-LM prompts (excludes sub_lm_prompt/sub_lm_raw
+    # which would cause recursive prompt growth).
+    _HISTORY_PROMPT_KEYS = (
+        "section",
+        "slot",
+        "energy",
+        "density",
+        "key",
+        "chords",
+        "drums",
+        "bass",
+        "pad",
+        "stab",
+        "texture",
+    )
+
+    def _strip_history(entries):
+        """Strip bulky debug fields from history entries before embedding in prompts."""
+        return [{k: h[k] for k in _HISTORY_PROMPT_KEYS if k in h} for h in entries]
+
     def _build_compose_prompt(creative_prompt, next_slot):
         """Assemble the sub-LM prompt from history, arc phase, and direction."""
         # Compressed history: last 5 full entries + summary of earlier
@@ -398,13 +634,28 @@ def make_tools(
                 h.get("drums", "none"),
                 h.get("bass", "none"),
                 h.get("pad", "none"),
+                h.get("stab", "none"),
+                h.get("texture", "none"),
             )
             combo_counts[combo] = combo_counts.get(combo, 0) + 1
-        overused = [f"{d}/{b}/{p}" for (d, b, p), c in combo_counts.items() if c >= 3]
+        overused = ["/".join(c) for c, n in combo_counts.items() if n >= 3]
         variety_note = ""
         if overused:
             variety_note = (
                 f"OVERUSED combos (pick something DIFFERENT): {', '.join(overused)}.\n"
+            )
+
+        # Chord progression variety enforcement
+        chord_history = ["/".join(h.get("chords", [])) for h in _live_history]
+        chord_counts = {}
+        for prog in chord_history:
+            chord_counts[prog] = chord_counts.get(prog, 0) + 1
+        overused_chords = [p for p, c in chord_counts.items() if c >= 2]
+        chord_variety_note = ""
+        if overused_chords:
+            chord_variety_note = (
+                f"OVERUSED chord progressions (try something new): "
+                f"{', '.join(overused_chords)}.\n"
             )
 
         # Arc phase guidance
@@ -427,11 +678,19 @@ def make_tools(
                     "4-bar loops for peaks, 8-bar for dips.\n"
                 )
             else:
-                arc_phase = (
-                    f"FINAL third ({elapsed_min:.0f}/{total} min). "
-                    "Begin winding down — energy should generally descend (0.5-0.1). "
-                    "16-bar loops for hypnotic fade, sparser textures.\n"
-                )
+                max_energy = max((h["energy"] for h in _live_history), default=0)
+                if max_energy < 0.6:
+                    arc_phase = (
+                        f"FINAL third ({elapsed_min:.0f}/{total} min). "
+                        "You HAVEN'T PEAKED YET — push energy to 0.6+ before "
+                        "winding down. This is your last chance for a climax.\n"
+                    )
+                else:
+                    arc_phase = (
+                        f"FINAL third ({elapsed_min:.0f}/{total} min). "
+                        "Begin winding down — energy should generally descend "
+                        "(0.5-0.1). 16-bar loops for hypnotic fade, sparser textures.\n"
+                    )
 
         # Breakdown nudge: if energy sustained high without a valley, suggest one
         breakdown_nudge = ""
@@ -452,8 +711,9 @@ def make_tools(
             f"Brief: {brief}\n"
             f"{arc_phase}"
             f"{earlier_summary}"
-            f"Recent sections: {json.dumps(recent)}\n"
+            f"Recent sections: {json.dumps(_strip_history(recent))}\n"
             f"{variety_note}"
+            f"{chord_variety_note}"
             f"{breakdown_nudge}"
             f"Creative direction: {creative_prompt}\n\n"
             f"Return a single JSON object with these fields:\n"
@@ -469,6 +729,10 @@ def make_tools(
             f"  bass: 'rolling_16th'|'offbeat_8th'|'pulsing_8th'|'sustained'|"
             f"'walking'|'none'\n"
             f"  pad: 'sustained'|'atmospheric'|'pulsing'|'arpeggiated'|"
+            f"'swells'|'none'\n"
+            f"  stab: 'sustained'|'atmospheric'|'pulsing'|'arpeggiated'|"
+            f"'swells'|'none'\n"
+            f"  texture: 'sustained'|'atmospheric'|'pulsing'|'arpeggiated'|"
             f"'swells'|'none'\n\n"
             f"Make bold creative choices that serve the direction. "
             f"Respond with ONLY the JSON object."
@@ -485,29 +749,31 @@ def make_tools(
             return clip_info, None
 
         # Transition fades: fade out tracks that go from active to "none"
-        fade_tracks = []
+        fade_tracks = {}  # track_name -> original volume to restore
         if _live_history:
             prev = _live_history[-1]
             for track_name, role in _track_roles.items():
-                if role not in ("drums", "bass", "pad"):
+                if role not in ("drums", "bass", "pad", "stab", "texture"):
                     continue
                 was_active = prev.get(role, "none") != "none"
                 now_silent = section.get(role, "none") == "none"
                 if was_active and now_silent:
                     try:
+                        t = session._t(track_name)
+                        original_vol = session.api.track(t).get("volume")
                         session.fade(track_name, 0.0, steps=4, duration=0.5)
-                        fade_tracks.append(track_name)
-                    except Exception:
-                        pass
+                        fade_tracks[track_name] = original_vol
+                    except Exception as e:
+                        print(f"  [FADE] Could not fade {track_name}: {e}")
 
         fire_scene(section["slot"])
 
-        # Restore faded tracks to default volume after scene fires
-        for track_name in fade_tracks:
+        # Restore faded tracks to their prior volume after scene fires
+        for track_name, original_vol in fade_tracks.items():
             try:
-                session.fade(track_name, 0.85, steps=4, duration=0.5)
-            except Exception:
-                pass
+                session.fade(track_name, original_vol, steps=4, duration=0.5)
+            except Exception as e:
+                print(f"  [FADE] Could not fade {track_name}: {e}")
 
         wait_result = wait(section["bars"])
         wait_info = json.loads(wait_result)
@@ -556,7 +822,15 @@ def make_tools(
                     "raw": response_text[:500],
                 }
             )
-        section = json.loads(m.group())
+        try:
+            section = json.loads(m.group())
+        except json.JSONDecodeError as e:
+            return json.dumps(
+                {
+                    "error": f"Sub-LM returned invalid JSON: {e}",
+                    "raw": response_text[:500],
+                }
+            )
 
         # Validate and clamp
         section.setdefault("slot", next_slot)
@@ -567,7 +841,8 @@ def make_tools(
         energy_before_clamp = float(section["energy"])
         section["energy"] = max(0.0, min(1.0, energy_before_clamp))
 
-        # Energy guardrails: nudge sub-LM output toward arc-appropriate range
+        # Guardrails are slightly wider than prompt suggestions to allow
+        # sub-LM creative freedom while preventing extremes.
         guardrails_applied = []
         info = _get_elapsed()
         if info:
@@ -589,13 +864,20 @@ def make_tools(
                     if section["bars"] > 8:
                         guardrails_applied.append("middle_bars_cap_8")
                     section["bars"] = min(section["bars"], 8)
-            # Final: no override, let it wind down naturally
+            else:
+                # Final phase: if no peak happened yet, enforce a floor
+                max_energy_so_far = max((h["energy"] for h in _live_history), default=0)
+                if max_energy_so_far < 0.6:
+                    section["energy"] = max(0.5, section["energy"])
+                    guardrails_applied.append("no_peak_floor_0.50")
 
         section.setdefault("key", "C")
         section.setdefault("chords", [section["key"] + "m7"])
         section.setdefault("drums", "none")
         section.setdefault("bass", "none")
         section.setdefault("pad", "sustained")
+        section.setdefault("stab", "none")
+        section.setdefault("texture", "none")
         section.setdefault("name", f"Section {section['slot']}")
 
         clip_info, wait_info = _execute_section(section)
@@ -604,8 +886,8 @@ def make_tools(
             return json.dumps(clip_info)
 
         # Texture density: fraction of instruments active (0.0-1.0)
-        _STYLE_KEYS = ("drums", "bass", "pad")
-        density = sum(1 for k in _STYLE_KEYS if section[k] != "none") / 3
+        _STYLE_KEYS = ("drums", "bass", "pad", "stab", "texture")
+        density = sum(1 for k in _STYLE_KEYS if section[k] != "none") / len(_STYLE_KEYS)
 
         _live_history.append(
             {
@@ -618,6 +900,9 @@ def make_tools(
                 "drums": section["drums"],
                 "bass": section["bass"],
                 "pad": section["pad"],
+                "stab": section["stab"],
+                "texture": section["texture"],
+                "creative_prompt": creative_prompt,
                 "sub_lm_prompt": prompt,
                 "sub_lm_raw": response_text[:1000],
                 "energy_before_clamp": round(energy_before_clamp, 3),
@@ -658,7 +943,13 @@ def make_tools(
         for h in _live_history:
             k = h.get("key", "?")
             keys_used[k] = keys_used.get(k, 0) + 1
-            combo = (h.get("drums", "?"), h.get("bass", "?"), h.get("pad", "?"))
+            combo = (
+                h.get("drums", "?"),
+                h.get("bass", "?"),
+                h.get("pad", "?"),
+                h.get("stab", "?"),
+                h.get("texture", "?"),
+            )
             combo_counts[combo] = combo_counts.get(combo, 0) + 1
 
         # Energy bands
@@ -692,7 +983,7 @@ def make_tools(
             energy_delta = abs(curr["energy"] - prev["energy"])
             style_changes = sum(
                 1
-                for k in ("drums", "bass", "pad")
+                for k in ("drums", "bass", "pad", "stab", "texture")
                 if curr.get(k, "none") != prev.get(k, "none")
             )
             contrasts.append(energy_delta + style_changes * 0.1)
@@ -709,7 +1000,7 @@ def make_tools(
             tail_style_same = all(
                 tail[i].get(k) == tail[0].get(k)
                 for i in range(1, len(tail))
-                for k in ("drums", "bass", "pad")
+                for k in ("drums", "bass", "pad", "stab", "texture")
             )
             if max(tail_energy_deltas) < 0.1 and tail_style_same:
                 low_contrast_warning = (
@@ -729,10 +1020,8 @@ def make_tools(
             "keys_used": keys_used,
             "unique_style_combos": len(combo_counts),
             "most_used_combos": [
-                {"style": f"{d}/{b}/{p}", "count": c}
-                for (d, b, p), c in sorted(combo_counts.items(), key=lambda x: -x[1])[
-                    :5
-                ]
+                {"style": "/".join(combo), "count": c}
+                for combo, c in sorted(combo_counts.items(), key=lambda x: -x[1])[:5]
             ],
         }
 
@@ -763,10 +1052,15 @@ def make_tools(
         Returns 'READY' if all milestones are met, or lists what's still missing.
         """
         issues = []
-        if not _done["browse"]:
-            issues.append("browse() not called — search for instruments first")
-        if not _done["tracks"]:
-            issues.append("create_tracks() not called — set up your tracks")
+        if live_mode:
+            # In live mode, setup_session() handles browse + tracks
+            if not _done["tracks"]:
+                issues.append("setup_session() not called — set up your session first")
+        else:
+            if not _done["browse"]:
+                issues.append("browse() not called — search for instruments first")
+            if not _done["tracks"]:
+                issues.append("create_tracks() not called — set up your tracks")
         if _done["clips"] < min_clips:
             issues.append(
                 f"only {_done['clips']} clips created (need at least {min_clips}) — build more scenes"
@@ -794,27 +1088,46 @@ def make_tools(
             return "NOT READY to submit:\n" + "\n".join(f"  - {i}" for i in issues)
         return "READY — call SUBMIT(report) in the NEXT step (no other tool calls)."
 
-    tools = [
-        set_tempo,
-        get_status,
-        create_tracks,
-        browse,
-        load_instrument,
-        load_sound,
-        load_effect,
-        load_drum_kit,
-        get_params,
-        set_param,
-        set_mix,
-        play,
-        stop,
-        fire_clip,
-        fire_scene,
-        write_clip,
-        ready_to_submit,
-    ]
     if live_mode:
-        tools.extend([wait, elapsed, compose_next, get_arc_summary])
+        # Live mode: setup_session handles all browsing/loading.
+        # No browse/create_tracks/load_* — prevents manual-browse rabbit holes.
+        tools = [
+            setup_session,
+            set_tempo,
+            get_status,
+            get_params,
+            set_param,
+            set_mix,
+            stop,
+            fire_clip,
+            fire_scene,
+            write_clip,
+            ready_to_submit,
+            wait,
+            elapsed,
+            compose_next,
+            get_arc_summary,
+        ]
+    else:
+        tools = [
+            set_tempo,
+            get_status,
+            create_tracks,
+            browse,
+            load_instrument,
+            load_sound,
+            load_effect,
+            load_drum_kit,
+            get_params,
+            set_param,
+            set_mix,
+            play,
+            stop,
+            fire_clip,
+            fire_scene,
+            write_clip,
+            ready_to_submit,
+        ]
 
     tools_by_name = {t.__name__: t for t in tools}
     return tools, tools_by_name, _live_history

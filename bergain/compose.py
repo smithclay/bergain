@@ -53,28 +53,25 @@ class Compose(dspy.Signature):
     RULES:
       - Use llm_query() to decide key, chords, energy levels, and style names.
       - write_clip() handles all MIDI rendering — you never build note arrays.
+      - write_clip() only writes to Drums, Bass, and Pad tracks. Extra tracks
+        (Lead, FX, etc.) are not filled by write_clip — use them manually.
       - Each scene needs DIFFERENT energy/style/chords — monotony is failure.
       - Scenes are indexed 0, 1, 2... — lower slots = lower energy is natural
         but not required. The DJ chooses fire order.
       - ready_to_submit() checks milestones. Only SUBMIT after it says READY.
-      - Most tools return JSON (parse with json.loads). Exceptions: browse() and
-        get_status() return plain text.
+      - Most tools return JSON (parse with json.loads). Exceptions: browse(),
+        get_status(), and ready_to_submit() return plain text.
+      - NEVER use f-strings with JSON content — the braces conflict with Python
+        format syntax. Use plain strings or triple-quoted strings for JSON.
 
     EXAMPLE (each step = one code block, separate execution):
       Step 1: browse("909", "Drums"); create_tracks(json.dumps([
                 {"name":"Drums","drum_kit":"909 Core Kit.adg"},
                 {"name":"Bass","instrument":"Operator"},
                 {"name":"Pad","sound":"Warm Pad"}])); set_tempo(130)
-      Step 2: plan = llm_query('Dark techno in F minor. Build 6 scenes for
-                live performance. Return JSON: {"key":"F","scenes":[
-                  {"name":"Ambient","slot":0,"bars":8,"energy":0.2,
-                   "chords":["Fm"],"drums":"minimal","bass":"none","pad":"atmospheric"},
-                  {"name":"Groove","slot":1,"bars":4,"energy":0.5,
-                   "chords":["Fm","Cm"],"drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"},
-                  {"name":"Drive","slot":2,"bars":4,"energy":0.7,...},
-                  {"name":"Peak","slot":3,"bars":4,"energy":0.95,...},
-                  {"name":"Breakdown","slot":4,"bars":8,"energy":0.3,...},
-                  {"name":"Outro","slot":5,"bars":8,"energy":0.15,...}]}')
+      Step 2: plan = llm_query('Dark techno in F minor. Build 6 scenes for '
+                'live performance. Return JSON with key and scenes array, each '
+                'scene having: name, slot, bars, energy, chords, drums, bass, pad.')
       Step 3: write_clip(json.dumps({"name":"Ambient","slot":0,"bars":8,
                 "energy":0.2,"key":"F","chords":["Fm"],
                 "drums":"minimal","bass":"none","pad":"atmospheric"}))
@@ -103,7 +100,11 @@ class LiveCompose(dspy.Signature):
     energy values). You are the conductor, not the arranger.
 
     WORKFLOW:
-      SETUP (one step): browse() + create_tracks() + set_tempo() + play()
+      SETUP (one step): setup_session(config_json) — creates tracks with
+        role-appropriate sounds, sets tempo, starts playback. ONE call does
+        everything. Just specify name + role for each track; the search is
+        optional (sensible defaults per role). Include 5 tracks: drums, bass,
+        pad, stab, texture.
       EVOLVE (repeat): Call compose_next() with creative direction. It handles
         everything: sub-LM query, clip writing, scene firing, waiting.
         Check get_arc_summary() every ~5 sections to course-correct.
@@ -118,28 +119,37 @@ class LiveCompose(dspy.Signature):
       shows a flat trend, force a contrast.
 
     RULES:
+      - setup_session() handles ALL sound loading. Do NOT try to browse or
+        load instruments manually — those tools are not available.
       - compose_next() takes a creative prompt, NOT parameter values.
         Good: "Bring in a deep walking bass, let the drums rest"
         Bad:  "energy 0.55, drums half_time, bass sustained"
       - compose_next() tracks history and enforces variety automatically.
       - Call get_arc_summary() to see energy curve, style stats, timing phase.
       - ready_to_submit() enforces minimum elapsed time. Don't rush.
-      - Most tools return JSON (parse with json.loads). Exceptions: browse()
-        and get_status() return plain text.
+      - Most tools return JSON (parse with json.loads). Exceptions:
+        get_status() and ready_to_submit() return plain text.
+      - NEVER use f-strings with JSON content — the braces conflict with Python
+        format syntax. Use plain strings or triple-quoted strings for JSON.
 
     EXAMPLE (each step = one code block, separate execution):
-      Step 1: browse("909", "Drums"); create_tracks(json.dumps([
-                {"name":"Drums","drum_kit":"909 Core Kit.adg"},
-                {"name":"Bass","instrument":"Operator"},
-                {"name":"Pad","sound":"Warm Pad"}])); set_tempo(128); play()
-      Step 2: print(compose_next("Open with atmosphere — just pads, no rhythm, "
-                "let the space breathe. Dreamy and mysterious."))
+      Step 1: print(setup_session(json.dumps({
+                "tempo": 128,
+                "tracks": [
+                  {"name":"Drums","role":"drums"},
+                  {"name":"Bass","role":"bass"},
+                  {"name":"Pad","role":"pad"},
+                  {"name":"Stab","role":"stab"},
+                  {"name":"Texture","role":"texture"}
+                ]})))
+      Step 2: print(compose_next("Open with atmosphere — just pads and texture, "
+                "no rhythm, let the space breathe. Dreamy and mysterious."))
       Step 3: print(compose_next("Introduce a gentle pulse — minimal drums, "
                 "maybe a soft bass note. Keep the energy low but add momentum."))
       Step 4: print(compose_next("Build — more rhythmic drive, bring the bass "
-                "forward, add some chord movement."))
+                "forward, add stab hits and some chord movement."))
       Step 5: arc = json.loads(get_arc_summary())
-              print(f"Phase: {arc['phase']}, trend: {arc['energy_trend']}")
+              print("Phase: " + arc['phase'] + ", trend: " + arc['energy_trend'])
               # Adjust direction based on arc...
               print(compose_next("We need contrast — drop to a quiet interlude, "
                 "strip away the drums, just pads and atmosphere."))
@@ -182,8 +192,8 @@ def save_trajectory(prediction, brief, log_dir, live_history=None):
             trajectory = json.loads(raw)
         elif isinstance(raw, list):
             trajectory = raw
-    except (AttributeError, json.JSONDecodeError, TypeError):
-        pass
+    except (AttributeError, json.JSONDecodeError, TypeError) as e:
+        print(f"  [WARNING] Could not extract trajectory: {type(e).__name__}: {e}")
 
     data = {
         "brief": brief,
@@ -272,6 +282,13 @@ def main():
     else:
         print("Error: provide a brief as argument or via --brief-file")
         return
+
+    # Live mode needs at least 5 min for the RLM to set up and compose
+    if args.live and args.duration < 5:
+        print(
+            f"  [NOTE] Bumping duration from {args.duration} to 5 min (minimum for live mode)"
+        )
+        args.duration = 5
 
     # Apply mode-appropriate defaults for unset arguments
     defaults = (60, 60, 3) if args.live else (30, 40, 6)
