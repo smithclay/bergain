@@ -15,6 +15,7 @@ from bergain.music import (
     render_drums,
     render_pads,
 )
+from bergain.progress import ProgressState
 from bergain.tools import make_tools
 
 
@@ -104,6 +105,22 @@ def _setup_tracks(tools_by_name):
                 {"name": "Bass", "instrument": "Operator"},
                 {"name": "Pad", "sound": "Warm Pad"},
             ]
+        )
+    )
+
+
+def _setup_tracks_live(tools_by_name):
+    """Use setup_session (live mode) to populate _track_roles and start playback."""
+    tools_by_name["setup_session"](
+        json.dumps(
+            {
+                "tempo": 120,
+                "tracks": [
+                    {"name": "Drums", "role": "drums"},
+                    {"name": "Bass", "role": "bass"},
+                    {"name": "Pad", "role": "pad"},
+                ],
+            }
         )
     )
 
@@ -252,7 +269,7 @@ def test_arc_summary_after_sections(session):
     _, tools_by_name, _ = make_tools(
         session, live_mode=True, duration_minutes=10, sub_lm=None, brief="test"
     )
-    _setup_tracks(tools_by_name)
+    _setup_tracks_live(tools_by_name)
 
     # Manually populate _live_history via write_clip + direct list access
     # We'll use write_clip to bump clip count, then check arc is still empty
@@ -294,9 +311,7 @@ def test_compose_next_basic(session):
         sub_lm=mock_lm,
         brief="Test lullaby",
     )
-    _setup_tracks(tools_by_name)
-    # Start playback to init timer
-    tools_by_name["play"]()
+    _setup_tracks_live(tools_by_name)
 
     result = json.loads(tools_by_name["compose_next"]("Open with soft atmosphere"))
 
@@ -326,8 +341,7 @@ def test_compose_next_bad_json_from_lm(session):
     _, tools_by_name, _ = make_tools(
         session, live_mode=True, duration_minutes=10, sub_lm=mock_lm, brief="test"
     )
-    _setup_tracks(tools_by_name)
-    tools_by_name["play"]()
+    _setup_tracks_live(tools_by_name)
 
     result = json.loads(tools_by_name["compose_next"]("do something"))
     assert "error" in result
@@ -360,8 +374,7 @@ def test_compose_next_history_compression(session):
     _, tools_by_name, _ = make_tools(
         session, live_mode=True, duration_minutes=60, sub_lm=mock_lm, brief="test"
     )
-    _setup_tracks(tools_by_name)
-    tools_by_name["play"]()
+    _setup_tracks_live(tools_by_name)
 
     # Compose 7 sections
     for i in range(7):
@@ -399,8 +412,7 @@ def test_compose_next_overused_combo_warning(session):
     _, tools_by_name, _ = make_tools(
         session, live_mode=True, duration_minutes=60, sub_lm=mock_lm, brief="test"
     )
-    _setup_tracks(tools_by_name)
-    tools_by_name["play"]()
+    _setup_tracks_live(tools_by_name)
 
     for i in range(4):
         tools_by_name["compose_next"](f"step {i}")
@@ -442,8 +454,7 @@ def test_compose_next_arc_phases(session):
     _, tools_by_name, _ = make_tools(
         session, live_mode=True, duration_minutes=3, sub_lm=mock_lm, brief="test"
     )
-    _setup_tracks(tools_by_name)
-    tools_by_name["play"]()
+    _setup_tracks_live(tools_by_name)
 
     # First call — should be "OPENING"
     tools_by_name["compose_next"]("intro")
@@ -460,10 +471,9 @@ def test_ready_to_submit_live_mode_too_early(session):
     _, tools_by_name, _ = make_tools(
         session, min_clips=1, live_mode=True, duration_minutes=60
     )
-    _setup_tracks(tools_by_name)
+    _setup_tracks_live(tools_by_name)
 
     # Write enough clips
-    tools_by_name["browse"]("test")
     tools_by_name["write_clip"](
         json.dumps(
             {
@@ -479,9 +489,6 @@ def test_ready_to_submit_live_mode_too_early(session):
             }
         )
     )
-
-    # Start playback
-    tools_by_name["play"]()
 
     result = tools_by_name["ready_to_submit"]()
     assert "NOT READY" in result
@@ -530,7 +537,7 @@ def test_elapsed_before_play(session):
 
 def test_elapsed_after_play(session):
     _, tools_by_name, _ = make_tools(session, live_mode=True, duration_minutes=10)
-    tools_by_name["play"]()
+    _setup_tracks_live(tools_by_name)  # setup_session starts playback
     # Sleep long enough that rounding to 1 decimal still shows > 0
     time.sleep(7)  # 7s = 0.117 min → rounds to 0.1
 
@@ -562,3 +569,119 @@ def test_palette_tools_exclude_live_only(session):
     assert "elapsed" not in names
     assert "compose_next" not in names
     assert "get_arc_summary" not in names
+
+
+# ---------------------------------------------------------------------------
+# Progress state tests — make_tools(..., progress=state)
+# ---------------------------------------------------------------------------
+
+
+def test_progress_browse_done(session):
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    assert not state.browse_done
+    tools_by_name["browse"]("test")
+    assert state.browse_done
+
+
+def test_progress_tracks_done(session):
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    assert not state.tracks_done
+    _setup_tracks(tools_by_name)
+    assert state.tracks_done
+
+
+def test_progress_clips_created(session):
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _setup_tracks(tools_by_name)
+    assert state.clips_created == 0
+    tools_by_name["write_clip"](
+        json.dumps(
+            {
+                "name": "Test",
+                "slot": 0,
+                "bars": 4,
+                "energy": 0.5,
+                "key": "C",
+                "chords": ["Cm"],
+                "drums": "minimal",
+                "bass": "sustained",
+                "pad": "sustained",
+            }
+        )
+    )
+    assert state.clips_created >= 1
+
+
+def test_progress_mix_done(session):
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _setup_tracks(tools_by_name)
+    assert not state.mix_done
+    tools_by_name["set_mix"](json.dumps({"Drums": 0.9}))
+    assert state.mix_done
+
+
+def test_progress_start_time_on_play(session):
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(
+        session, min_clips=1, live_mode=True, duration_minutes=10, progress=state
+    )
+    assert state.start_time is None
+    _setup_tracks_live(tools_by_name)  # setup_session starts playback + sets start_time
+    assert state.start_time is not None
+
+
+def test_progress_setup_session_updates(session):
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(
+        session, min_clips=1, live_mode=True, duration_minutes=10, progress=state
+    )
+    tools_by_name["setup_session"](
+        json.dumps(
+            {
+                "tempo": 120,
+                "tracks": [
+                    {"name": "Drums", "role": "drums"},
+                    {"name": "Bass", "role": "bass"},
+                ],
+            }
+        )
+    )
+    assert state.browse_done
+    assert state.tracks_done
+    assert state.start_time is not None
+
+
+def test_progress_compose_next_updates(session):
+    state = ProgressState()
+    section = {
+        "name": "Test Section",
+        "slot": 0,
+        "bars": 4,
+        "energy": 0.4,
+        "key": "C",
+        "chords": ["Cm"],
+        "drums": "minimal",
+        "bass": "none",
+        "pad": "atmospheric",
+    }
+    mock_lm = _make_mock_sub_lm(section)
+    _, tools_by_name, _ = make_tools(
+        session,
+        live_mode=True,
+        duration_minutes=10,
+        sub_lm=mock_lm,
+        brief="test",
+        progress=state,
+    )
+    _setup_tracks_live(tools_by_name)
+
+    tools_by_name["compose_next"]("open with atmosphere")
+
+    assert len(state.sections) == 1
+    assert state.latest_creative_prompt == "open with atmosphere"
+    assert state.latest_sub_lm_response != ""
+    assert state.elapsed_min > 0

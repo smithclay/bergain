@@ -1,5 +1,5 @@
-"""Allow `python -m bergain` to run the composer."""
+"""Allow `python -m bergain` to run the unified CLI."""
 
-from bergain.compose import main
+from bergain.cli import main
 
 main()

@@ -383,8 +383,50 @@ CE went from 3.25 → 4.83 across these fixes. PC spiked to 4.42 when the record
 
 ### Known Issues (TODO)
 
-1. **Duration not respected.** The e2e script bumps short durations (e.g. 2 min → 5 min) because the RLM needs setup iterations. But the RLM also overshoots — a 5-min target produces 7+ min recordings. The `ready_to_submit` elapsed check uses 80% threshold but the RLM keeps composing past it. Need harder enforcement or a time-based hard stop.
+1. **~~Duration not respected.~~** FIXED. Three changes: (a) `compose_next()` now has a hard stop — returns error JSON when `remaining_min <= 0`, (b) bars are capped to fit within remaining time so a 16-bar section can't overshoot, (c) the sub-LM prompt includes a time budget line (`~N bars remaining, ~M sections`) with explicit wind-down instructions when nearing the end.
 
 2. **Scene transitions are jarring.** Per-track clip firing with `clip_slot.call("fire")` triggers clips independently — they may not quantize to the same beat. Ableton's scene-level fire synchronizes all clips to the global quantize setting, but per-track firing loses this. Potential fixes: (a) set global quantize before firing, (b) fire all music tracks in a tight loop so they're within the same quantize window, (c) use `clip_slot.set("fire_button")` if it respects quantize. The current fades (`session.fade()`) help mask transitions but don't solve the root timing issue.
 
 3. **Modal `structure` endpoint 500s.** The aesthetics scorer's structure analysis consistently fails with 500 errors, which may be dragging CE scores down since the composite score can't factor in structure. Need to debug the Modal endpoint separately.
+
+## Palette Mode vs Live Mode: Head-to-Head Comparison
+
+Ran both modes with the same brief ("dark minimal techno dance", 128 BPM) and scored the exports.
+
+### Setup
+
+- **Palette mode** (`Compose` signature): RLM browses instruments, plans 6 scenes via `llm_query()`, builds all clips, then `fire_scenes.py` fires each scene for 16 bars with session recording.
+- **Live mode** (`LiveCompose` signature): RLM calls `setup_session()` then `compose_next()` repeatedly. Each section is composed, fired, and waited on in real time. Exported via the e2e pipeline.
+
+### Results
+
+| Metric | Palette + Fire | Live (compose_next) | Delta |
+|--------|---------------|---------------------|-------|
+| Duration | 4.0 min | 6.7 min | — |
+| CE (enjoyment) | **5.99** | 4.47 | +1.52 |
+| PQ (quality) | **7.54** | 6.88 | +0.66 |
+| PC (complexity) | **4.11** | 3.74 | +0.37 |
+| CU (usefulness) | **7.41** | 6.59 | +0.82 |
+| **OBJ** | **6.43** | 5.26 | **+1.17** |
+
+### Why Palette Mode Wins
+
+1. **Transitions are cleaner.** `session.fire(scene)` fires all music-track clips in a tight loop (per-track to skip the capture track). Clips land on the same quantize boundary. Live mode's `compose_next()` writes clips and fires each scene independently, which can desync across tracks.
+
+2. **Duration penalty.** The scorer penalizes longer audio (~0.24 CE per extra minute). The 6.7 min live capture eats ~0.6 CE vs the 4.0 min palette capture just from duration alone.
+
+3. **Coherent planning.** Palette mode plans all scenes upfront with a single `llm_query()` call, producing a coherent energy arc (0.2 → 0.45 → 0.9 → 0.35 → 0.95 → 0.25). Live mode's sub-LM generates each section independently with only arc-summary context, producing a less structured arc.
+
+4. **Better instruments.** Palette mode uses `browse()` to find specific instruments (909 Core Kit, Operator, Drifting Ambient Pad). Live mode's `setup_session()` picks sensible defaults but can't search the browser as thoroughly.
+
+5. **More notes per clip.** Palette mode's peak scenes had 144 drum notes and 128 bass notes per clip. Live mode peaked at 357 drum notes (21-bar section) but with less density variation between sections.
+
+### Implications
+
+- **For short pieces (3-8 min):** Palette + auto-fire is strictly better. The upfront planning produces more coherent arcs, and scene-level firing gives cleaner transitions.
+- **For long performances (15+ min):** Live mode's real-time adaptation may still be needed — palette mode can't react to how the music evolves.
+- **Hybrid approach:** Use palette mode to build the grid, then live mode for in-performance tweaks (fader rides, filter sweeps, scene ordering). This would combine palette quality with live flexibility.
+
+### The `fire_scenes.py` Script
+
+Created `scripts/fire_scenes.py` to auto-fire palette scenes with recording. Key detail: must use `session.fire(scene)` (not `session.api.scene().call("fire")`) to skip the capture track during recording. The first attempt used direct scene fire, which disrupted the capture track and produced an empty export — same bug documented in the export section above.

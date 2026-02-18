@@ -13,7 +13,13 @@ from .music import clamp_note, render_drums, render_bass, render_pads
 
 
 def make_tools(
-    session, min_clips=6, live_mode=False, duration_minutes=60, sub_lm=None, brief=""
+    session,
+    min_clips=6,
+    live_mode=False,
+    duration_minutes=60,
+    sub_lm=None,
+    brief="",
+    progress=None,
 ):
     """Create tool closures over a live Session, with milestone tracking.
 
@@ -107,6 +113,8 @@ def make_tools(
         from .session import Track
 
         _done["tracks"] = True
+        if progress:
+            progress.tracks_done = True
         specs = json.loads(tracks_json)
         _track_roles.clear()
         tracks = []
@@ -169,6 +177,8 @@ def make_tools(
             in search results. Load them by exact name with load_effect() — no browse needed.
         """
         _done["browse"] = True
+        if progress:
+            progress.browse_done = True
         results = session.browse(query, category=category or None)
         names = [r["name"] for r in results[:20]]
         return "\n".join(names) if names else "NO_RESULTS"
@@ -232,6 +242,8 @@ def make_tools(
         volume: 0.0-1.0 (0.85 default). pan: -1.0 (left) to 1.0 (right).
         """
         _done["mix"] = True
+        if progress:
+            progress.mix_done = True
         levels = json.loads(levels_json)
         session.mix(**levels)
         return json.dumps({"mixed": list(levels.keys())})
@@ -242,6 +254,8 @@ def make_tools(
         session.play()
         if live_mode and _live_state["start_time"] is None:
             _live_state["start_time"] = time.time()
+        if progress and _live_state["start_time"]:
+            progress.start_time = _live_state["start_time"]
         return json.dumps({"playing": True})
 
     # Known-good single-keyword fallbacks per role.
@@ -391,6 +405,10 @@ def make_tools(
         _done["tracks"] = True
         if _live_state["start_time"] is None:
             _live_state["start_time"] = time.time()
+        if progress:
+            progress.browse_done = True
+            progress.tracks_done = True
+            progress.start_time = _live_state["start_time"]
 
         return json.dumps(
             {
@@ -512,6 +530,8 @@ def make_tools(
                 details.append(f"{clip_name}: {len(clamped)} notes")
 
         _done["clips"] += clips_created
+        if progress:
+            progress.clips_created = _done["clips"]
         return json.dumps(
             {
                 "clip": name,
@@ -706,9 +726,38 @@ def make_tools(
                     "a valley to rebuild from.\n"
                 )
 
+        # Time budget context for the sub-LM
+        time_budget = ""
+        info = _get_elapsed()
+        if info:
+            elapsed_min, remaining_min = info
+            bpm = session.status().get("tempo", 120)
+            bar_duration_min = 4 * 60.0 / bpm / 60.0
+            remaining_bars = (
+                int(remaining_min / bar_duration_min) if bar_duration_min > 0 else 999
+            )
+            est_sections_left = max(
+                1, remaining_bars // 8
+            )  # rough estimate at 8 bars avg
+            time_budget = (
+                f"TIME: {elapsed_min:.1f}/{_live_state['target_duration']} min elapsed, "
+                f"~{remaining_bars} bars remaining (~{est_sections_left} sections). "
+            )
+            if remaining_min < 2:
+                time_budget += (
+                    "WRAPPING UP — make this the final section, wind down energy.\n"
+                )
+            elif remaining_min < _live_state["target_duration"] * 0.2:
+                time_budget += (
+                    "NEARING END — start winding down, prefer shorter bars (4-8).\n"
+                )
+            else:
+                time_budget += "\n"
+
         return (
             f"You are composing the next section of a live performance.\n"
             f"Brief: {brief}\n"
+            f"{time_budget}"
             f"{arc_phase}"
             f"{earlier_summary}"
             f"Recent sections: {json.dumps(_strip_history(recent))}\n"
@@ -803,14 +852,31 @@ def make_tools(
                 {"error": "compose_next requires sub_lm (live mode only)"}
             )
 
+        # Hard stop: refuse to compose if we've hit or exceeded target duration.
+        # RLM ignores soft signals — this is the only reliable way to enforce duration.
+        info = _get_elapsed()
+        if info:
+            elapsed_min, remaining_min = info
+            if remaining_min <= 0:
+                return json.dumps(
+                    {
+                        "error": "TIME IS UP — target duration reached. "
+                        "Call SUBMIT(report) now. Do NOT compose more sections.",
+                        "elapsed_minutes": round(elapsed_min, 1),
+                        "target_minutes": _live_state["target_duration"],
+                    }
+                )
+
         next_slot = max((h["slot"] for h in _live_history), default=-1) + 1
         prompt = _build_compose_prompt(creative_prompt, next_slot)
 
         completions = sub_lm(messages=[{"role": "user", "content": prompt}])
         raw = completions[0] if completions else ""
         # sub_lm returns dicts with 'text' key — normalise to string
+        reasoning_text = ""
         if isinstance(raw, dict):
             response_text = raw.get("text") or raw.get("content") or str(raw)
+            reasoning_text = raw.get("reasoning_content") or ""
         else:
             response_text = str(raw)
 
@@ -871,6 +937,24 @@ def make_tools(
                     section["energy"] = max(0.5, section["energy"])
                     guardrails_applied.append("no_peak_floor_0.50")
 
+        # Cap bars to fit within remaining time (with buffer for next section).
+        # This prevents a 16-bar section when only 1 minute remains.
+        info = _get_elapsed()
+        if info:
+            _, remaining_min = info
+            bpm = session.status().get("tempo", 120)
+            bar_duration_min = 4 * 60.0 / bpm / 60.0  # 1 bar in minutes
+            max_bars_remaining = (
+                int(remaining_min / bar_duration_min)
+                if bar_duration_min > 0
+                else section["bars"]
+            )
+            if max_bars_remaining < 4:
+                max_bars_remaining = 4  # minimum viable section
+            if section["bars"] > max_bars_remaining:
+                guardrails_applied.append(f"time_cap_{max_bars_remaining}_bars")
+                section["bars"] = max_bars_remaining
+
         section.setdefault("key", "C")
         section.setdefault("chords", [section["key"] + "m7"])
         section.setdefault("drums", "none")
@@ -909,6 +993,19 @@ def make_tools(
                 "guardrails_applied": guardrails_applied,
             }
         )
+
+        if progress:
+            progress.sections = _live_history
+            progress.latest_creative_prompt = creative_prompt
+            progress.latest_sub_lm_response = response_text[:500]
+            progress.latest_sub_lm_reasoning = reasoning_text[:500]
+            progress.latest_guardrails = guardrails_applied
+            progress.latest_energy_before_clamp = energy_before_clamp
+            progress.latest_section = section
+            info_p = _get_elapsed()
+            if info_p:
+                progress.elapsed_min = info_p[0]
+                progress.remaining_min = info_p[1]
 
         style = "/".join(section[k] for k in _STYLE_KEYS)
         return json.dumps(

@@ -77,62 +77,13 @@ analysis_image = (
     .pip_install(
         "librosa",
         "numpy",
+        "scipy",
+        "scikit-learn",
         "soundfile",
         "python-multipart",
         "fastapi[standard]",
     )
 )
-
-# ---------------------------------------------------------------------------
-# Structure analysis image (allin1 — torch + demucs + natten)
-# ---------------------------------------------------------------------------
-
-structure_image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
-    .entrypoint([])
-    .apt_install("libsndfile1", "ffmpeg", "git")
-    .pip_install("torch==2.1.0", "torchaudio==2.1.0")
-    .pip_install("natten==0.17.1")
-    .run_commands("pip install git+https://github.com/CPJKU/madmom")
-    .pip_install(
-        "allin1", "demucs", "soundfile", "python-multipart", "fastapi[standard]"
-    )
-    # Pre-download demucs model during image build
-    .run_commands(
-        "python -c 'from demucs.pretrained import get_model; get_model(\"htdemucs\")'"
-    )
-)
-
-
-@app.cls(gpu="T4", scaledown_window=120, image=structure_image)
-class StructureAnalyzer:
-    @modal.method()
-    def analyze(self, audio_data: bytes) -> dict:
-        import allin1
-        import tempfile
-        import os
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_data)
-            tmp_path = f.name
-
-        try:
-            result = allin1.analyze(tmp_path, device="cuda")
-            beats = result.beats
-            downbeats = result.downbeats
-            return {
-                "bpm": result.bpm,
-                "beats": beats.tolist() if hasattr(beats, "tolist") else list(beats),
-                "downbeats": downbeats.tolist()
-                if hasattr(downbeats, "tolist")
-                else list(downbeats),
-                "segments": [
-                    {"start": s.start, "end": s.end, "label": s.label}
-                    for s in result.segments
-                ],
-            }
-        finally:
-            os.unlink(tmp_path)
 
 
 @app.cls(scaledown_window=120, image=analysis_image)
@@ -158,7 +109,7 @@ class Analyzer:
         if analysis_type == "key":
             return self._detect_key(y, sr)
         elif analysis_type == "structure":
-            return await self._analyze_structure(data, bpm)
+            return self._analyze_structure(y, sr, bpm)
         elif analysis_type == "energy":
             return self._analyze_energy(y, sr, bpm)
         elif analysis_type == "onsets":
@@ -234,12 +185,107 @@ class Analyzer:
             "all_keys": all_keys[:6],
         }
 
-    async def _analyze_structure(self, audio_data: bytes, bpm: Optional[float]):
-        import asyncio
+    def _analyze_structure(self, y, sr, bpm: Optional[float]):
+        import librosa
+        import numpy as np
+        import scipy.ndimage
+        import scipy.sparse.csgraph
+        import scipy.linalg
+        import sklearn.cluster
 
-        return await asyncio.get_event_loop().run_in_executor(
-            None, lambda: StructureAnalyzer().analyze.remote(audio_data)
+        # Beat tracking
+        tempo, beats = librosa.beat.beat_track(y=y, sr=sr, trim=False)
+        detected_bpm = bpm or (
+            float(tempo) if not hasattr(tempo, "__len__") else float(tempo[0])
         )
+        beat_times = librosa.frames_to_time(beats, sr=sr)
+
+        if len(beats) < 4:
+            return {
+                "bpm": round(detected_bpm, 2),
+                "beats": [round(float(t), 4) for t in beat_times],
+                "downbeats": [],
+                "segments": [],
+            }
+
+        # Beat-synchronous CQT for structure analysis
+        C = np.abs(librosa.cqt(y=y, sr=sr, bins_per_octave=36, n_bins=7 * 36))
+        Csync = librosa.util.sync(C, beats, aggregate=np.median)
+
+        # Recurrence matrix (harmonic/timbral repetition)
+        R = librosa.segment.recurrence_matrix(Csync, width=3, mode="affinity", sym=True)
+        df = librosa.segment.timelag_filter(scipy.ndimage.median_filter)
+        Rf = df(R, size=(1, 7))
+
+        # Path similarity from MFCCs (sequential continuity)
+        mfcc = librosa.feature.mfcc(y=y, sr=sr)
+        Msync = librosa.util.sync(mfcc, beats)
+        path_distance = np.sum(np.diff(Msync, axis=1) ** 2, axis=0)
+        sigma = np.median(path_distance) + 1e-10
+        path_sim = np.exp(-path_distance / sigma)
+        R_path = np.diag(path_sim, k=1) + np.diag(path_sim, k=-1)
+
+        # Balance recurrence and path matrices
+        deg_path = np.sum(R_path, axis=1)
+        deg_rec = np.sum(Rf, axis=1)
+        mu = deg_path.dot(deg_path + deg_rec) / (
+            np.sum((deg_path + deg_rec) ** 2) + 1e-10
+        )
+        A = mu * Rf + (1 - mu) * R_path
+
+        # Spectral clustering via normalized Laplacian
+        L = scipy.sparse.csgraph.laplacian(A, normed=True)
+        evals, evecs = scipy.linalg.eigh(L)
+        evecs = scipy.ndimage.median_filter(evecs, size=(9, 1))
+        Cnorm = np.cumsum(evecs**2, axis=1) ** 0.5
+
+        k = min(5, Csync.shape[1] - 1)
+        if k < 2:
+            return {
+                "bpm": round(detected_bpm, 2),
+                "beats": [round(float(t), 4) for t in beat_times],
+                "downbeats": [],
+                "segments": [],
+            }
+
+        X = evecs[:, :k] / (Cnorm[:, k - 1 : k] + 1e-10)
+        seg_ids = sklearn.cluster.KMeans(n_clusters=k, n_init=10).fit_predict(X)
+
+        # Extract segment boundaries and build segment list
+        bound_beats = 1 + np.flatnonzero(seg_ids[:-1] != seg_ids[1:])
+        bound_beats = np.concatenate([[0], bound_beats, [len(seg_ids)]])
+        bound_times = librosa.frames_to_time(beats[bound_beats[:-1]], sr=sr)
+        end_times = librosa.frames_to_time(
+            beats[np.minimum(bound_beats[1:], len(beats) - 1)], sr=sr
+        )
+
+        # Label segments by cluster — repeating clusters get same letter
+        label_map = {}
+        label_idx = 0
+        labels = "ABCDEFGHIJKLMNOP"
+        segments = []
+        for i in range(len(bound_times)):
+            cid = int(seg_ids[bound_beats[i]])
+            if cid not in label_map:
+                label_map[cid] = labels[label_idx % len(labels)]
+                label_idx += 1
+            segments.append(
+                {
+                    "start": round(float(bound_times[i]), 4),
+                    "end": round(float(end_times[i]), 4),
+                    "label": label_map[cid],
+                }
+            )
+
+        # Downbeats: assume 4/4, pick every 4th beat
+        downbeat_times = beat_times[::4]
+
+        return {
+            "bpm": round(detected_bpm, 2),
+            "beats": [round(float(t), 4) for t in beat_times],
+            "downbeats": [round(float(t), 4) for t in downbeat_times],
+            "segments": segments,
+        }
 
     def _analyze_energy(self, y, sr, bpm: Optional[float]):
         import librosa
