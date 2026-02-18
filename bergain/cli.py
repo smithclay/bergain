@@ -20,80 +20,67 @@ load_dotenv()
 
 
 # ---------------------------------------------------------------------------
-# LM wrapper — prints reasoning blocks and tracks call/token counts
+# LM patch — prints reasoning blocks and tracks call/token counts
 # ---------------------------------------------------------------------------
 
 
-class _ReasoningPrinter:
-    """Wraps a dspy.LM to surface reasoning and track usage stats.
+def _patch_reasoning(lm, label="DJ", progress=None):
+    """Patch a dspy.LM instance to print reasoning and track usage.
 
-    Prints the model's reasoning_content (chain-of-thought) to stdout as
-    each step executes, and maintains a running count of LLM calls and
-    tokens for heartbeat display.
+    Swaps the instance's class to a dynamic subclass that intercepts
+    __call__.  isinstance(lm, dspy.LM) still passes because the patched
+    class inherits from the original.
     """
+    step_counter = [0]
+    orig_call = type(lm).__call__
 
-    def __init__(self, lm, label="DJ", progress=None):
-        object.__setattr__(self, "_lm", lm)
-        object.__setattr__(self, "_label", label)
-        object.__setattr__(self, "_step", 0)
-        object.__setattr__(self, "_total_tokens", 0)
-        object.__setattr__(self, "_progress", progress)
+    class _Patched(type(lm)):
+        def __call__(self, *args, **kwargs):
+            result = orig_call(self, *args, **kwargs)
+            step_counter[0] += 1
 
-    def __call__(self, *args, **kwargs):
-        result = self._lm(*args, **kwargs)
-        object.__setattr__(self, "_step", self._step + 1)
-
-        # Extract reasoning and token usage from the response
-        reasoning = ""
-        tokens_this_call = 0
-        if result:
-            raw = result[0]
-            if isinstance(raw, dict):
-                reasoning = raw.get("reasoning_content") or ""
-                # LiteLLM / DSPy often stash usage in the response or on the LM
-                usage = raw.get("usage") or {}
-                tokens_this_call = usage.get("total_tokens", 0)
-
-        # Try to get usage from the LM's history if not in the response
-        if tokens_this_call == 0:
-            try:
-                hist = self._lm.history
-                if hist:
-                    latest = hist[-1]
-                    usage = latest.get("usage") or latest.get("response", {}).get(
-                        "usage", {}
-                    )
+            # Extract reasoning and token usage from the response
+            reasoning = ""
+            tokens_this_call = 0
+            if result:
+                raw = result[0]
+                if isinstance(raw, dict):
+                    reasoning = raw.get("reasoning_content") or ""
+                    usage = raw.get("usage") or {}
                     tokens_this_call = usage.get("total_tokens", 0)
-            except Exception:
-                pass
 
-        object.__setattr__(self, "_total_tokens", self._total_tokens + tokens_this_call)
+            # Try to get usage from the LM's history if not in the response
+            if tokens_this_call == 0:
+                try:
+                    hist = self.history
+                    if hist:
+                        latest = hist[-1]
+                        usage = latest.get("usage") or latest.get("response", {}).get(
+                            "usage", {}
+                        )
+                        tokens_this_call = usage.get("total_tokens", 0)
+                except Exception:
+                    pass
 
-        # Update progress state for heartbeat display
-        if self._progress:
-            self._progress.llm_calls += 1
-            self._progress.llm_tokens += tokens_this_call
+            # Update progress state for heartbeat display
+            if progress:
+                progress.llm_calls += 1
+                progress.llm_tokens += tokens_this_call
 
-        # Print reasoning block
-        if reasoning:
-            text = reasoning.strip()
-            if len(text) > 800:
-                text = text[:800] + "..."
-            token_note = f"  ({tokens_this_call:,} tok)" if tokens_this_call else ""
-            print(f"\n  [{self._label} step {self._step}]{token_note}")
-            for line in text.split("\n"):
-                print(f"    {line}")
+            # Print reasoning block
+            if reasoning:
+                text = reasoning.strip()
+                if len(text) > 800:
+                    text = text[:800] + "..."
+                token_note = f"  ({tokens_this_call:,} tok)" if tokens_this_call else ""
+                print(f"\n  [{label} step {step_counter[0]}]{token_note}")
+                for line in text.split("\n"):
+                    print(f"    {line}")
 
-        return result
+            return result
 
-    def __getattr__(self, name):
-        return getattr(object.__getattribute__(self, "_lm"), name)
-
-    def __setattr__(self, name, value):
-        if name.startswith("_"):
-            object.__setattr__(self, name, value)
-        else:
-            setattr(object.__getattribute__(self, "_lm"), name, value)
+    lm.__class__ = _Patched
+    return lm
 
 
 def _parse_args():
@@ -343,12 +330,12 @@ def cmd_compose(args):
     else:
         display = ProgressDisplay(state)
 
-    # Configure LMs — wrap with _ReasoningPrinter to show thinking + heartbeat
-    raw_lm = dspy.LM(args.model, cache=False)
-    lm = _ReasoningPrinter(raw_lm, label="DJ", progress=state)
+    # Configure LMs — patch to show reasoning + heartbeat
+    lm = _patch_reasoning(dspy.LM(args.model, cache=False), label="DJ", progress=state)
     if args.sub_model:
-        raw_sub = dspy.LM(args.sub_model, cache=False)
-        sub_lm = _ReasoningPrinter(raw_sub, label="Arranger", progress=state)
+        sub_lm = _patch_reasoning(
+            dspy.LM(args.sub_model, cache=False), label="Arranger", progress=state
+        )
     else:
         sub_lm = lm
     dspy.configure(lm=lm)
