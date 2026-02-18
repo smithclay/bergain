@@ -282,3 +282,109 @@ The conductor RLM (using `dspy.RLM`) consistently spends **2-4 iterations on set
 - **Simpler prompts still win** — we added zero text to the conductor LM's signature docstring. All improvements were tool-layer mechanics.
 - **Named patterns remain the right abstraction** — the sub-LM reliably generates `"four_on_floor"`, `"rolling_16th"`, `"swells"` etc. No need for note-level control.
 - **The RLM is a good conductor** — when compose_next works, the RLM makes intelligent creative choices about when to build, when to break down, and when to peak. It reads the arc summary and adjusts. The weak link was always the sub-LM's energy calibration, not the conductor's musical judgment.
+
+## Audio Export (`--export`): Lessons from Debugging the Capture Pipeline
+
+The `--export` flag records the entire compose session to WAV via Ableton's session recording + Resampling input routing. Getting this right required understanding several Ableton quirks and fixing three distinct layers of bugs.
+
+### The Core Problem
+
+The compose pipeline flow is: `start_recording()` → `setup()` (destroys all tracks) → compose → `stop_recording()`. But `setup()` deletes every track including the capture track, then creates new ones. The capture track must be restored after setup, and recording must resume.
+
+### Use `set/session_record` Not `trigger_session_record`
+
+**This is the single most important export fix.** AbletonOSC exposes two recording controls:
+
+- `trigger_session_record` — a **toggle** that alternates start/stop. Not idempotent. Calling it twice stops what you just started. Gets stuck at `session_record_status=1` (transitioning) when the transport state is ambiguous.
+- `set/session_record` — a **direct setter** (1=on, 0=off). Idempotent. Reliably reaches status=2.
+
+We wasted hours debugging `trigger_session_record` stuck at status=1. The toggle is fundamentally unreliable when called programmatically because you can't know the current state with certainty. **Always use the direct setter:**
+
+```python
+# GOOD: direct setter — idempotent, reliable
+self.api.song.set("session_record", 1)  # start
+self.api.song.set("session_record", 0)  # stop
+
+# BAD: toggle — unreliable, state-dependent
+self.api.song.call("trigger_session_record")  # start? stop? who knows
+```
+
+Poll `session_record_status` after setting: 0=off, 1=transitioning, 2=recording. Budget up to 8s of polling (16 × 0.5s) for status=2. If status falls to 0 after settling, re-set once.
+
+### Scene Fires Disrupt the Capture Track
+
+**The second major bug.** `fire_scene()` fires ALL clips in a scene row — including the capture track's recording slot. This stops the recording and replays the captured silence.
+
+Symptoms: exported WAV is 45s of silence with a tiny transient at the end. The recording clip in slot 0 captured only the pre-scene-fire period (no music yet), then scene fire stopped the recording and replayed that silent clip.
+
+**Fix**: When recording is active, fire clips on each music track individually, skipping the capture track:
+
+```python
+def fire(self, scene):
+    if self._recording:
+        capture_idx = self._capture_track_idx
+        for t in range(num_tracks):
+            if t == capture_idx:
+                continue
+            self.api.clip_slot(t, scene).call("fire")
+    else:
+        self.api.scene(scene).call("fire")
+```
+
+This keeps the capture track's session recording uninterrupted while music clips transition normally.
+
+### Normalization Is Required
+
+The old reference renderer normalized to -1 dBFS before scoring. Without normalization, captured audio at -38 dBFS (1.2% peak) scores terribly on CE and PC. After normalization to -1 dBFS (89.1% peak), the same content scores much higher.
+
+Implementation uses stdlib `wave` + `struct` — no new deps. Handles 16-bit and 24-bit WAVs. The gain factor is printed for debugging (`gain=1.58x` means the capture was already loud; `gain=667x` means it was nearly silent).
+
+### Deferred Recording Pattern
+
+After `setup()` restores the capture track, the transport is stopped. Recording must be deferred until the transport starts:
+
+```python
+# In setup() restore block:
+self._record_pending = True
+
+# In play()/fire()/fire_clip():
+if self._record_pending:
+    time.sleep(2.0)  # transport + routing need time to settle
+    self.api.song.set("session_record", 1)  # direct setter
+    self._record_pending = False
+```
+
+### Instrument Loading: Retry + Verify
+
+Browser loading (`load_instrument`, `load_drum_kit`, `load_sound`) intermittently times out, especially for drum kits. A single failed load leaves a track with 0 devices, producing silence that tanks CE and PC.
+
+**Fix**: Retry up to 2 times on TimeoutError with 1s backoff. After all loads complete, verify each track has `num_devices > 0` and print warnings for empty tracks. Default track volume boosted from 0.85 to 1.0 for MIDI instruments (inherently quieter than mixed samples; normalization handles any clipping).
+
+### Capture Track Setup
+
+The capture track uses:
+- **Input routing**: "Resampling" (captures master output)
+- **Output routing**: "Sends Only" (prevents feedback loop)
+- **Monitoring**: "In" (state=0, so it actually captures)
+- **Armed**: Yes (required for session recording)
+
+After setting each property, read it back and verify. Print warnings if routing doesn't match expectations — this caught issues early.
+
+### Export Score Progression
+
+| Fix | CE | PC | Key Change |
+|-----|----|----|-----------|
+| Baseline (silent export) | 3.25 | 1.70 | No normalization, toggle recording |
+| + Normalization | 3.25 | 1.70 | Audio audible but still captured silence |
+| + Direct setter (`set/session_record`) | 3.70 | 4.42 | Recording actually captures audio |
+| + Per-track firing (skip capture track) | 4.83 | 3.65 | Full-duration continuous audio |
+
+CE went from 3.25 → 4.83 across these fixes. PC spiked to 4.42 when the recording first captured real audio. The remaining CE gap to 6+ likely requires fixing the Modal `structure` analysis endpoint (currently 500ing) and improving musical content density.
+
+### Known Issues (TODO)
+
+1. **Duration not respected.** The e2e script bumps short durations (e.g. 2 min → 5 min) because the RLM needs setup iterations. But the RLM also overshoots — a 5-min target produces 7+ min recordings. The `ready_to_submit` elapsed check uses 80% threshold but the RLM keeps composing past it. Need harder enforcement or a time-based hard stop.
+
+2. **Scene transitions are jarring.** Per-track clip firing with `clip_slot.call("fire")` triggers clips independently — they may not quantize to the same beat. Ableton's scene-level fire synchronizes all clips to the global quantize setting, but per-track firing loses this. Potential fixes: (a) set global quantize before firing, (b) fire all music tracks in a tight loop so they're within the same quantize window, (c) use `clip_slot.set("fire_button")` if it respects quantize. The current fades (`session.fade()`) help mask transitions but don't solve the root timing issue.
+
+3. **Modal `structure` endpoint 500s.** The aesthetics scorer's structure analysis consistently fails with 500 errors, which may be dragging CE scores down since the composite score can't factor in structure. Need to debug the Modal endpoint separately.

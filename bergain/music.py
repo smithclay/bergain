@@ -35,7 +35,7 @@ CLAP = 39
 CLOSED_HAT = 42
 OPEN_HAT = 46
 RIDE = 51
-PERC = 47
+PERC = 47  # GM: Low-Mid Tom, used as general percussion texture
 
 
 # ---------------------------------------------------------------------------
@@ -118,8 +118,7 @@ def render_drums(bars, energy, style, section_name="x", beats_per_bar=4):
     if style == "four_on_floor":
         for beat in range(total_beats):
             # Kick on every beat
-            if energy >= 0.0:
-                notes.append((KICK, float(beat), 0.5, v()))
+            notes.append((KICK, float(beat), 0.5, v()))
             # Closed hat on 8ths
             if energy >= 0.2:
                 notes.append((CLOSED_HAT, float(beat), 0.25, v() - 15))
@@ -301,8 +300,7 @@ def render_bass(
                 beat += 0.25
 
         elif style == "walking":
-            # Jazz walking bass — quarter notes stepping through chord tones
-            # and chromatic passing tones
+            # Walking pattern: root, minor 3rd, 5th, 4th — intentionally dark voicing
             chord_pitches = [root_midi, root_midi + 3, root_midi + 7, root_midi + 5]
             beat = chord_start
             step_idx = 0
@@ -345,13 +343,10 @@ def render_pads(
 
         # Voicing octave based on energy
         if energy < 0.3:
-            # Open voicing: spread across octaves 3-5
+            # Open voicing: spread across octaves 3-4
             pitches = chord_to_midi(chord_name, 3)
-            # Spread: move some notes up an octave
             if len(pitches) >= 3:
                 pitches = [pitches[0], pitches[1] + 12, pitches[2] + 12]
-                if len(pitches) > 3:
-                    pitches.append(pitches[3] + 24)
         elif energy < 0.7:
             # Close voicing in octave 4
             pitches = chord_to_midi(chord_name, 4)

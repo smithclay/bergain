@@ -2,7 +2,22 @@ import io
 from typing import Optional
 
 import modal
-from fastapi import UploadFile, File, Form
+
+try:
+    from fastapi import UploadFile, File, Form
+except ImportError:
+    # Stubs so module loads locally without fastapi; Modal containers have it
+    from typing import Any
+
+    def File(default: Any = ...):
+        return default  # type: ignore[misc]
+
+    def Form(default: Any = ...):
+        return default  # type: ignore[misc]
+
+    class UploadFile:
+        pass  # type: ignore[no-redef]
+
 
 app = modal.App("bergain-aesthetics")
 
@@ -64,13 +79,63 @@ analysis_image = (
         "numpy",
         "soundfile",
         "python-multipart",
-        "replicate",
         "fastapi[standard]",
     )
 )
 
+# ---------------------------------------------------------------------------
+# Structure analysis image (allin1 — torch + demucs + natten)
+# ---------------------------------------------------------------------------
 
-@app.cls(gpu="T4", scaledown_window=120, image=analysis_image)
+structure_image = (
+    modal.Image.from_registry("nvidia/cuda:12.1.0-devel-ubuntu22.04", add_python="3.11")
+    .entrypoint([])
+    .apt_install("libsndfile1", "ffmpeg", "git")
+    .pip_install("torch==2.1.0", "torchaudio==2.1.0")
+    .pip_install("natten==0.17.1")
+    .run_commands("pip install git+https://github.com/CPJKU/madmom")
+    .pip_install(
+        "allin1", "demucs", "soundfile", "python-multipart", "fastapi[standard]"
+    )
+    # Pre-download demucs model during image build
+    .run_commands(
+        "python -c 'from demucs.pretrained import get_model; get_model(\"htdemucs\")'"
+    )
+)
+
+
+@app.cls(gpu="T4", scaledown_window=120, image=structure_image)
+class StructureAnalyzer:
+    @modal.method()
+    def analyze(self, audio_data: bytes) -> dict:
+        import allin1
+        import tempfile
+        import os
+
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            f.write(audio_data)
+            tmp_path = f.name
+
+        try:
+            result = allin1.analyze(tmp_path, device="cuda")
+            beats = result.beats
+            downbeats = result.downbeats
+            return {
+                "bpm": result.bpm,
+                "beats": beats.tolist() if hasattr(beats, "tolist") else list(beats),
+                "downbeats": downbeats.tolist()
+                if hasattr(downbeats, "tolist")
+                else list(downbeats),
+                "segments": [
+                    {"start": s.start, "end": s.end, "label": s.label}
+                    for s in result.segments
+                ],
+            }
+        finally:
+            os.unlink(tmp_path)
+
+
+@app.cls(scaledown_window=120, image=analysis_image)
 class Analyzer:
     @modal.fastapi_endpoint(method="POST")
     async def analyze(
@@ -170,22 +235,11 @@ class Analyzer:
         }
 
     async def _analyze_structure(self, audio_data: bytes, bpm: Optional[float]):
-        import replicate
-        import tempfile
-        import os
+        import asyncio
 
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
-            f.write(audio_data)
-            tmp_path = f.name
-
-        try:
-            output = replicate.run(
-                "mtg/music-structure-analysis:latest",
-                input={"audio": open(tmp_path, "rb")},
-            )
-            return output
-        finally:
-            os.unlink(tmp_path)
+        return await asyncio.get_event_loop().run_in_executor(
+            None, lambda: StructureAnalyzer().analyze.remote(audio_data)
+        )
 
     def _analyze_energy(self, y, sr, bpm: Optional[float]):
         import librosa

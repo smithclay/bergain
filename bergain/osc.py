@@ -58,8 +58,8 @@ class AbletonOSC:
                 handler = self._handlers.get(msg.address)
             if handler:
                 handler(msg.address, msg.params)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  [OSC ERROR] {type(e).__name__}: {e}")
 
     def _build_msg(self, address: str, params) -> bytes:
         builder = OscMessageBuilder(address)
@@ -211,7 +211,12 @@ class LiveAPI:
 
 ANALYZER_URL = os.environ.get(
     "BERGAIN_ANALYZER_URL",
-    "https://bergain-aesthetics--analyzer-analyze.modal.run",
+    "https://smithclay--bergain-aesthetics-analyzer-analyze.modal.run",
+)
+
+JUDGE_URL = os.environ.get(
+    "BERGAIN_JUDGE_URL",
+    "https://smithclay--bergain-aesthetics-judge-score.modal.run",
 )
 
 
@@ -311,6 +316,20 @@ def analyze_audio(
     finally:
         for h in handles:
             h.close()
+
+
+def score_audio(file_path: str) -> dict:
+    """Send audio to the Modal Judge endpoint for audiobox_aesthetics scoring."""
+    import requests
+
+    with open(file_path, "rb") as f:
+        resp = requests.post(
+            JUDGE_URL,
+            files={"file": ("audio.wav", f, "audio/wav")},
+            timeout=120,
+        )
+        resp.raise_for_status()
+        return resp.json()
 
 
 # ---------------------------------------------------------------------------

@@ -4,18 +4,111 @@ Session wraps LiveAPI with track-name resolution, device-param caching,
 and convenience methods for the live DJ workflow.
 """
 
+import math
+import os
+import shutil
+import struct
 import time
+import wave
 from dataclasses import dataclass, field
 
 from .osc import LiveAPI, REMOTE_PORT, LOCAL_PORT
 
 
 def _notes_to_wire(tuples):
-    """Convert [(pitch, start, dur, vel), ...] to flat wire format for OSC."""
+    """Convert [(pitch, start, dur, vel), ...] to flat AbletonOSC wire format.
+
+    Each note becomes [pitch, start, duration, velocity, mute] where mute=0 means not muted."""
     flat = []
     for p, s, d, v in tuples:
         flat.extend([p, float(s), float(d), v, 0])
     return flat
+
+
+def _normalize_wav(path, target_dbfs=-1.0):
+    """Normalize a WAV file to target_dbfs peak level in-place.
+
+    Uses stdlib wave + struct — no external deps.
+    """
+    target_linear = 10 ** (target_dbfs / 20.0)  # -1 dBFS ≈ 0.891
+
+    with wave.open(path, "rb") as wf:
+        n_channels = wf.getnchannels()
+        sampwidth = wf.getsampwidth()
+        n_frames = wf.getnframes()
+        framerate = wf.getframerate()
+        raw = wf.readframes(n_frames)
+
+    if sampwidth == 2:
+        fmt = f"<{n_frames * n_channels}h"
+        max_val = 32767
+    elif sampwidth == 3:
+        # 24-bit: unpack manually
+        samples = []
+        for i in range(0, len(raw), 3):
+            b = raw[i : i + 3]
+            val = int.from_bytes(b, "little", signed=True)
+            samples.append(val)
+        max_val = 2**23 - 1
+        peak = max(abs(s) for s in samples) if samples else 0
+        if peak == 0:
+            print(f"  [normalize] {path}: silent file, skipping")
+            return
+        gain = (target_linear * max_val) / peak
+        print(
+            f"  [normalize] peak={peak}/{max_val} ({20 * math.log10(peak / max_val):.1f} dBFS), gain={gain:.2f}x"
+        )
+        out = bytearray()
+        for s in samples:
+            clamped = max(-max_val - 1, min(max_val, int(s * gain)))
+            out.extend(clamped.to_bytes(3, "little", signed=True))
+        with wave.open(path, "wb") as wf:
+            wf.setnchannels(n_channels)
+            wf.setsampwidth(sampwidth)
+            wf.setframerate(framerate)
+            wf.writeframes(bytes(out))
+        return
+    else:
+        print(f"  [normalize] Unsupported sample width {sampwidth}, skipping")
+        return
+
+    # 16-bit path
+    samples = list(struct.unpack(fmt, raw))
+    peak = max(abs(s) for s in samples) if samples else 0
+    if peak == 0:
+        print(f"  [normalize] {path}: silent file, skipping")
+        return
+
+    gain = (target_linear * max_val) / peak
+    print(
+        f"  [normalize] peak={peak}/{max_val} ({20 * math.log10(peak / max_val):.1f} dBFS), gain={gain:.2f}x"
+    )
+    normalized = [max(-max_val - 1, min(max_val, int(s * gain))) for s in samples]
+    out_raw = struct.pack(fmt, *normalized)
+
+    with wave.open(path, "wb") as wf:
+        wf.setnchannels(n_channels)
+        wf.setsampwidth(sampwidth)
+        wf.setframerate(framerate)
+        wf.writeframes(out_raw)
+
+
+def _concatenate_wavs(paths, dest):
+    """Concatenate multiple WAV files into one. All must share the same format."""
+    with wave.open(paths[0], "rb") as first:
+        params = first.getparams()
+
+    with wave.open(dest, "wb") as out:
+        out.setparams(params)
+        for p in paths:
+            with wave.open(p, "rb") as wf:
+                out.writeframes(wf.readframes(wf.getnframes()))
+
+
+def _wav_duration(path):
+    """Return duration of a WAV file in seconds."""
+    with wave.open(path, "rb") as wf:
+        return wf.getnframes() / wf.getframerate()
 
 
 class Session:
@@ -63,14 +156,14 @@ class Session:
                 name = self.api.track(i).get("name")
                 self._tracks[name] = i
         except TimeoutError:
-            pass
+            print("  [WARNING] Could not read tracks from Ableton — names unavailable")
         try:
             num_scenes = self.api.song.get("num_scenes")
             for i in range(num_scenes):
                 name = self.api.scene(i).get("name")
                 self._scenes[name] = i
         except TimeoutError:
-            pass
+            print("  [WARNING] Could not read scenes from Ableton — names unavailable")
 
     # -- Clips -------------------------------------------------------------------
 
@@ -147,6 +240,7 @@ class Session:
         """Fire a clip by track name and slot index."""
         t = self._t(track)
         self.api.clip_slot(t, slot).call("fire")
+        self._maybe_start_deferred_recording()
 
     def stop_clip(self, track, slot=None):
         """Stop the playing clip on a track.
@@ -162,8 +256,25 @@ class Session:
     # -- Scene -------------------------------------------------------------------
 
     def fire(self, scene):
-        """Fire a scene by name or index."""
-        self.api.scene(self._s(scene)).call("fire")
+        """Fire a scene by name or index.
+
+        When recording, fires clips on each music track individually to avoid
+        disrupting the capture track's session recording.
+        """
+        s = self._s(scene)
+        if getattr(self, "_recording", False):
+            capture_idx = getattr(self, "_capture_track_idx", None)
+            num_tracks = self.api.song.get("num_tracks")
+            for t in range(num_tracks):
+                if t == capture_idx:
+                    continue
+                try:
+                    self.api.clip_slot(t, s).call("fire")
+                except Exception:
+                    pass
+        else:
+            self.api.scene(s).call("fire")
+        self._maybe_start_deferred_recording()
 
     # -- Device params -----------------------------------------------------------
 
@@ -195,7 +306,8 @@ class Session:
         if value is not None:
             self.api.device(t, device).set("parameter/value", idx, float(value))
             return value
-        return self.api.device(t, device).get("parameter/value", idx)
+        result = self.api.device(t, device).query("get/parameter/value", idx)
+        return result[-1]
 
     # -- Browser loading ---------------------------------------------------------
 
@@ -211,7 +323,7 @@ class Session:
         results = list(raw)
         pairs = [
             {"category": results[i], "name": results[i + 1]}
-            for i in range(0, len(results), 2)
+            for i in range(0, len(results) - 1, 2)
         ]
         if category:
             pairs = [p for p in pairs if category.lower() in p["category"].lower()]
@@ -234,24 +346,39 @@ class Session:
                 return {"type": label, "name": result}
         return None
 
-    def _browser_load(self, track, method, name, label, wait=1.0):
-        """Load a browser item onto a track, printing success/failure."""
+    def _browser_load(self, track, method, name, label, wait=1.0, retries=2):
+        """Load a browser item onto a track, printing success/failure.
+
+        Retries up to `retries` times on TimeoutError with 1s backoff.
+        """
         t = self._t(track)
-        self.api.view.set("selected_track", t)
-        time.sleep(0.1)
-        try:
-            result = (
-                self.api.browser.query(method, name)
-                if name
-                else self.api.browser.query(method)
-            )
-            loaded = result[0] if result else name
-            time.sleep(wait)
-            print(f"  Track {t}: loaded {label} '{loaded}'")
-            return loaded
-        except TimeoutError:
-            print(f"  Track {t}: FAILED to load {label} '{name}'")
-            return None
+        for attempt in range(1 + retries):
+            self.api.view.set("selected_track", t)
+            time.sleep(0.1)
+            try:
+                result = (
+                    self.api.browser.query(method, name)
+                    if name
+                    else self.api.browser.query(method)
+                )
+                if not result:
+                    print(f"  Track {t}: '{name}' not found in browser")
+                    return None
+                loaded = result[0]
+                time.sleep(wait)
+                print(f"  Track {t}: loaded {label} '{loaded}'")
+                return loaded
+            except TimeoutError:
+                if attempt < retries:
+                    print(
+                        f"  Track {t}: load {label} '{name}' timed out, retrying ({attempt + 1}/{retries})..."
+                    )
+                    time.sleep(1.0)
+                else:
+                    print(
+                        f"  Track {t}: FAILED to load {label} '{name}' after {1 + retries} attempts"
+                    )
+                    return None
 
     def load_instrument(self, track, name):
         """Load an instrument by name onto a track."""
@@ -303,12 +430,38 @@ class Session:
             for effect_name in t.effects:
                 self.load_effect(i, effect_name)
 
+        # Verify instruments loaded (at least 1 device per track that requested one)
+        for i, t in enumerate(tracks):
+            if t.instrument or t.drum_kit or t.sound:
+                try:
+                    num_devices = self.api.track(i).get("num_devices")
+                    if num_devices == 0:
+                        print(
+                            f"  [setup] WARNING: Track {i} '{t.name}' has 0 devices — instrument may have failed to load"
+                        )
+                except TimeoutError:
+                    pass
+
         # Set mix
         for i, t in enumerate(tracks):
             self.api.track(i).set("volume", t.volume)
             self.api.track(i).set("panning", t.pan)
 
         self.refresh()
+
+        # Restore capture track if recording was active before setup.
+        # The old capture track was destroyed along with all other tracks.
+        # We stop any zombie session recording, recreate the capture track,
+        # and defer triggering recording until the transport starts (play/fire)
+        # because trigger_session_record needs a running transport to work.
+        if getattr(self, "_recording", False):
+            print("  [export] Restoring capture track after setup...")
+            self._ensure_recording_stopped()
+            time.sleep(0.5)  # let Ableton settle after track churn
+            self._create_capture_track()
+            self._record_pending = True
+            print("  [export] Capture track ready — recording deferred until playback")
+
         return len(tracks)
 
     # -- Mix ---------------------------------------------------------------------
@@ -390,6 +543,7 @@ class Session:
 
     def play(self):
         self.api.song.call("start_playing")
+        self._maybe_start_deferred_recording()
 
     def stop(self):
         self.api.song.call("stop_playing")
@@ -485,6 +639,193 @@ class Session:
                 f"    [{t['index']}] {t['name']} vol={t['volume']:.2f} pan={t['pan']:.2f} ({devs}){slot}"
             )
         return s
+
+    # -- Audio Export ------------------------------------------------------------
+
+    def _create_capture_track(self):
+        """Create and configure the audio capture track at the end of the track list.
+
+        Sets up Resampling input, Sends Only output, Monitor In, and arms it.
+        Stores the track index in self._capture_track_idx.
+        """
+        num_tracks = self.api.song.get("num_tracks")
+        self.api.song.call("create_audio_track", num_tracks)
+        time.sleep(0.5)
+
+        capture_idx = num_tracks
+        self._capture_track_idx = capture_idx
+        self.api.track(capture_idx).set("name", "_capture")
+        time.sleep(0.2)
+
+        # Route: Resampling in, Sends Only out, Monitor In
+        self.api.track(capture_idx).set("input_routing_type", "Resampling")
+        time.sleep(0.3)
+        output_types = list(
+            self.api.track(capture_idx).query("get/available_output_routing_types")
+            or []
+        )
+        sends_name = next((n for n in output_types if "sends" in n.lower()), None)
+        if sends_name:
+            self.api.track(capture_idx).set("output_routing_type", sends_name)
+            time.sleep(0.3)
+        self.api.track(capture_idx).set("current_monitoring_state", 0)
+        time.sleep(0.2)
+
+        self.api.track(capture_idx).set("arm", 1)
+        time.sleep(0.3)
+
+        # Verify routing was applied correctly
+        try:
+            routing = self.api.track(capture_idx).get("input_routing_type")
+            monitoring = self.api.track(capture_idx).get("current_monitoring_state")
+            armed = self.api.track(capture_idx).get("arm")
+            print(
+                f"  [export] Capture track verified: routing={routing}, monitor={monitoring}, arm={armed}"
+            )
+            if "resampling" not in str(routing).lower():
+                print(
+                    f"  [export] WARNING: routing is '{routing}', expected 'Resampling'"
+                )
+            if monitoring != 0:
+                print(
+                    f"  [export] WARNING: monitoring is {monitoring}, expected 0 (In)"
+                )
+            if armed != 1:
+                print(f"  [export] WARNING: arm is {armed}, expected 1")
+        except TimeoutError:
+            print("  [export] WARNING: Could not verify capture track routing")
+
+    def _ensure_recording_stopped(self):
+        """Set session_record=0 and verify status reaches 0."""
+        self.api.song.set("session_record", 0)
+        for _ in range(8):
+            time.sleep(0.5)
+            try:
+                status = self.api.song.get("session_record_status")
+                if status == 0:
+                    return
+            except TimeoutError:
+                continue
+        print("  [export] WARNING: session_record_status not 0 after disabling")
+
+    def _trigger_recording(self):
+        """Start session recording using direct setter and verify it's active.
+
+        Uses set/session_record=1 (direct) instead of trigger_session_record
+        (toggle) to avoid ambiguous state when toggling mid-transition.
+        session_record_status: 0=off, 1=transition, 2=recording.
+        """
+        self.api.song.set("session_record", 1)
+
+        # Poll up to 8s for status=2
+        status = 0
+        for i in range(16):
+            time.sleep(0.5)
+            try:
+                status = self.api.song.get("session_record_status")
+            except TimeoutError:
+                continue
+            if status == 2:
+                print("  [export] Recording active (status=2)")
+                return
+            if status == 0 and i >= 4:
+                # Fell back to off — re-set
+                print(
+                    f"  [export] Recording status=0 after {(i + 1) * 0.5:.1f}s, re-setting..."
+                )
+                self.api.song.set("session_record", 1)
+
+        print(f"  [export] WARNING: Recording status={status} after polling (wanted 2)")
+
+    def _maybe_start_deferred_recording(self):
+        """Start session recording if it was deferred (waiting for transport)."""
+        if getattr(self, "_record_pending", False):
+            # Verify transport is actually running before triggering
+            time.sleep(2.0)
+            try:
+                playing = self.api.song.get("is_playing")
+                if not playing:
+                    print("  [export] Transport not running yet, waiting longer...")
+                    time.sleep(3.0)
+            except TimeoutError:
+                time.sleep(2.0)
+            self._trigger_recording()
+            self._record_pending = False
+
+    def start_recording(self):
+        """Create a capture track and begin session recording.
+
+        Creates an audio track with Resampling input (captures master output),
+        Sends Only output (prevents feedback), arms it, and triggers session
+        recording. Call stop_recording() after playback to retrieve the WAV.
+
+        The capture track is automatically restored if setup() is called
+        during recording (e.g. by setup_session in the compose pipeline).
+        """
+        self._recording = True
+        self._record_pending = False
+        self._create_capture_track()
+        self._trigger_recording()
+
+    def stop_recording(self, export_dir="exports") -> str | None:
+        """Stop recording, find the captured WAV, copy to export_dir.
+
+        Returns the path to the exported file, or None if no clip was found.
+        """
+        capture_idx = getattr(self, "_capture_track_idx", None)
+        if capture_idx is None:
+            print("  [export] No active recording to stop")
+            return None
+
+        # Stop playback (stops session recording too)
+        self.api.song.call("stop_playing")
+        time.sleep(1.0)
+
+        # Collect ALL recorded clips from the capture track.
+        # Session recording creates a new clip per scene fire, so audio
+        # is spread across multiple slots. Concatenate them in order.
+        clip_paths = []
+        num_scenes = self.api.song.get("num_scenes")
+        for slot in range(num_scenes):
+            try:
+                has = self.api.clip_slot(capture_idx, slot).query("get/has_clip")
+                if has and has[0]:
+                    result = self.api.clip(capture_idx, slot).query("get/file_path")
+                    fp = result[0] if result else None
+                    if fp and os.path.isfile(fp):
+                        clip_paths.append(fp)
+                        print(f"  [export] Found clip slot {slot}: {fp}")
+            except Exception:
+                pass
+
+        # Concatenate clips into a single WAV, then normalize
+        export_path = None
+        if clip_paths:
+            os.makedirs(export_dir, exist_ok=True)
+            dest = os.path.join(export_dir, f"capture_{int(time.time())}.wav")
+            if len(clip_paths) == 1:
+                shutil.copy2(clip_paths[0], dest)
+            else:
+                _concatenate_wavs(clip_paths, dest)
+            _normalize_wav(dest)
+            export_path = dest
+            size_kb = os.path.getsize(dest) / 1024
+            duration = _wav_duration(dest)
+            print(
+                f"  [export] Saved: {dest} ({size_kb:.1f} KB, {duration:.1f}s, {len(clip_paths)} clips merged)"
+            )
+        else:
+            print("  [export] WARNING: No recorded clips found on capture track")
+
+        # Cleanup: disarm and delete capture track
+        self._recording = False
+        self.api.track(capture_idx).set("arm", 0)
+        time.sleep(0.2)
+        self.api.song.call("delete_track", capture_idx)
+        time.sleep(0.3)
+        self._capture_track_idx = None
+
+        return export_path
 
     # -- Lifecycle ---------------------------------------------------------------
 

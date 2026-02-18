@@ -267,6 +267,11 @@ def parse_args():
         action="store_true",
         help="Print config and tools, don't connect to Ableton",
     )
+    p.add_argument(
+        "--export",
+        action="store_true",
+        help="Record audio during compose and export WAV to ./exports/",
+    )
     return p.parse_args()
 
 
@@ -350,6 +355,9 @@ def main():
         verbose=True,
     )
 
+    if args.export:
+        session.start_recording()
+
     try:
         print("  Starting composition...\n")
         prediction = composer(brief=brief)
@@ -359,7 +367,13 @@ def main():
     except KeyboardInterrupt:
         print("\n  Interrupted — stopping playback...")
     finally:
-        session.stop()
+        if args.export:
+            wav = session.stop_recording()
+            if wav:
+                print("\n  === Export ===")
+                print(f"  {wav}")
+        else:
+            session.stop()
         session.close()
 
 

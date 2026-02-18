@@ -377,7 +377,7 @@ def make_tools(
                     instrument=None,
                     drum_kit=drum_kit,
                     effects=effects,
-                    volume=spec.get("volume", 0.85),
+                    volume=spec.get("volume", 1.0),
                     pan=spec.get("pan", 0.0),
                 )
             )
