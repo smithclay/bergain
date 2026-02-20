@@ -159,6 +159,14 @@ def _parse_args():
         default="./output/compose/",
         help="Directory for output files (trajectory, WAV, report)",
     )
+    p.add_argument(
+        "--optimized",
+        nargs="?",
+        const="./output/gepa/best_instructions.json",
+        default=None,
+        metavar="PATH",
+        help="Load GEPA-optimized Compose instructions (default path: ./output/gepa/best_instructions.json)",
+    )
     return p.parse_args()
 
 
@@ -283,7 +291,7 @@ def _print_summary(report):
 
 def cmd_compose(args):
     """Run the full compose pipeline: compose -> export -> analyze -> report."""
-    from .compose import Compose, LiveCompose, _slugify
+    from .compose import Compose, LiveCompose, _slugify, load_optimized_signature
     from .progress import PlainProgress, ProgressDisplay, ProgressState
     from .session import Session
     from .tools import make_tools
@@ -313,6 +321,14 @@ def cmd_compose(args):
         args.max_llm_calls = defaults[1]
     if args.min_clips is None:
         args.min_clips = defaults[2]
+
+    # Load GEPA-optimized instructions if requested
+    if args.optimized:
+        loaded = load_optimized_signature(args.optimized)
+        if loaded:
+            print(f"  Loaded optimized Compose instructions from {args.optimized}")
+        else:
+            print("  WARNING: Could not load optimized instructions, using defaults")
 
     signature = LiveCompose if args.live else Compose
     mode_label = f"LIVE ({args.duration} min)" if args.live else "PALETTE"

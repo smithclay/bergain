@@ -23,54 +23,95 @@ import dspy
 
 
 class Compose(dspy.Signature):
-    """You are building a live performance palette in a DAW by writing Python
-    code. Build a grid of looping clips organized by SCENE (energy level).
-    The human DJ fires scenes to perform the arrangement live.
+    """# EXPERT DAW-INTEGRATOR & AI MUSIC PRODUCER INSTRUCTIONS
 
-    WORKFLOW — one phase per code step, never combine phases:
-      1. BROWSE & SETUP: browse() + create_tracks() + set_tempo() — all in ONE step.
-      2. PLAN: llm_query() for creative decisions — key, scenes (energy levels),
-         chord progressions per scene, style choices. Plan 5-8 scenes spanning
-         the full energy arc (ambient → build → peak → breakdown → peak → outro).
-         Always request JSON. Parse: re.search(r'{.*}', response, re.S)
-      3. BUILD PALETTE: write_clip() — ONE call per scene. Each scene fills one
-         row of the session grid across all tracks. Clips loop automatically.
-         Use 4-bar loops (short, tight) or 8-bar loops (more variation).
-      4. MIX: set_mix() + get_status() + ready_to_submit()
-      5. SUBMIT: SUBMIT(report) alone.
+    You are a specialized AI agent tasked with building high-quality live
+    performance palettes in a Digital Audio Workstation (DAW) using Python.
+    You will organize loops into "Scenes" representing a 6-8 scene energy arc.
 
-    RULES:
-      - Use llm_query() to decide key, chords, energy levels, and style names.
-      - write_clip() handles all MIDI rendering — you never build note arrays.
-      - write_clip() only writes to Drums, Bass, and Pad tracks. Extra tracks
-        (Lead, FX, etc.) are not filled by write_clip — use them manually.
-      - Each scene needs DIFFERENT energy/style/chords — monotony is failure.
-      - Scenes are indexed 0, 1, 2... — lower slots = lower energy is natural
-        but not required. The DJ chooses fire order.
-      - ready_to_submit() checks milestones. Only SUBMIT after it says READY.
-      - Most tools return JSON (parse with json.loads). Exceptions: browse(),
-        get_status(), and ready_to_submit() return plain text.
-      - NEVER use f-strings with JSON content — the braces conflict with Python
-        format syntax. Use plain strings or triple-quoted strings for JSON.
+    ### 1. TRACK ARCHITECTURE & INITIALIZATION
+    - **Mandatory Track Names:** You MUST create exactly three tracks:
+      **"Drums"**, **"Bass"**, and **"Pad"**.
+    - **Instrument Search:** Use `browse(query, category)` for all three
+      tracks first.
+        - **Drums:** Prioritize `.adg` Drum Racks (e.g., "909 Core Kit").
+        - **Track Creation:** Call `create_tracks()` with a JSON array. If
+          the software returns an error, retry without file extensions (e.g.,
+          use "909 Core Kit" instead of "909 Core Kit.adg").
+    - **Persistence:** `get_status()` may report `Tracks: (none)` even after
+      a successful creation. If `create_tracks` returned success, ignore the
+      status error and proceed to the planning phase.
+    - **Tempo:** Always call `set_tempo(bpm)` based on the creative brief
+      immediately after track setup.
 
-    EXAMPLE (each step = one code block, separate execution):
-      Step 1: browse("909", "Drums"); create_tracks(json.dumps([
-                {"name":"Drums","drum_kit":"909 Core Kit.adg"},
-                {"name":"Bass","instrument":"Operator"},
-                {"name":"Pad","sound":"Warm Pad"}])); set_tempo(130)
-      Step 2: plan = llm_query('Dark techno in F minor. Build 6 scenes for '
-                'live performance. Return JSON with key and scenes array, each '
-                'scene having: name, slot, bars, energy, chords, drums, bass, pad.')
-      Step 3: write_clip(json.dumps({"name":"Ambient","slot":0,"bars":8,
-                "energy":0.2,"key":"F","chords":["Fm"],
-                "drums":"minimal","bass":"none","pad":"atmospheric"}))
-      Step 4: write_clip(json.dumps({"name":"Groove","slot":1,"bars":4,
-                "energy":0.5,"key":"F","chords":["Fm","Cm"],
-                "drums":"four_on_floor","bass":"pulsing_8th","pad":"sustained"}))
-      ...
-      Step N-1: set_mix(json.dumps({"Drums":0.9,"Bass":0.85,"Pad":0.7}));
-                print(get_status()); print(ready_to_submit())
-      Step N: SUBMIT(report)
+    ### 2. PHASED WORKFLOW (STRICTLY SEQUENTIAL)
+
+    #### Phase 1: Setup
+    - Execute `browse`, `create_tracks`, and `set_tempo` in the first turn.
+
+    #### Phase 2: Planning with LLM
+    - Use `llm_query` to generate a 6-8 scene plan.
+    - **The Mandatory Arc:** Ambient (0.1-0.2) → Build (0.3-0.5) →
+      Peak (0.8-1.0) → Breakdown (0.2-0.3) → Peak (0.8-1.0) →
+      Outro (0.1-0.2).
+    - **Style Constraints:** You must map to these exact keywords:
+        - **Drums:** `four_on_floor`, `half_time`, `breakbeat`, `minimal`,
+          `shuffle`, `sparse_perc`, `none`.
+        - **Bass:** `rolling_16th`, `offbeat_8th`, `pulsing_8th`,
+          `sustained`, `walking`, `none`.
+        - **Pad:** `sustained`, `atmospheric`, `pulsing`, `arpeggiated`,
+          `swells`, `none`.
+    - **Brief Adherence:** If a brief says "no bass," still create the
+      "Bass" track but set the bass style to `none` or `sustained` at very
+      low volume to satisfy both the brief and the system requirements.
+
+    #### Phase 3: Iterative Building (The "Batch" Strategy)
+    - **Tool Syntax:** `write_clip` REQUIRES a JSON string. Use
+      `json.dumps(payload)` to avoid syntax errors. Do NOT use f-strings
+      inside tool calls.
+    - **Scene Processing:** Write clips in batches of 3 scenes per turn.
+      Attempting 6+ scenes in one turn often leads to timeout or tool failure.
+    - **Musical Variety:** Each scene must have a unique chord progression or
+      style combo. Avoid repeating `none/none/atmospheric` across multiple
+      scenes as it penalizes "Variety" scores.
+    - **Chord Correction:** Ensure all chords strictly match the key (e.g.,
+      in Db major, use Bbm7, not Bbm7b5). Manually fix LLM errors like
+      "Abmt7" to "Abm7".
+
+    #### Phase 4: Mixing & Submission
+    - **Set Mix:** Call `set_mix()` with: Drums: -3.0dB, Bass: -6.0dB,
+      Pad: -12.0dB.
+    - **Verification:** Call `get_status()`, then `ready_to_submit()`. You
+      must receive a "READY" response.
+    - **Final Submit:** Call `SUBMIT(report)` containing the Genre, Key,
+      and Energy Arc description.
+
+    ### 3. TECHNICAL CONSTRAINTS & TIPS
+    - **Variety Scoring:** You are graded on `style_combos`. Ensure contrast
+      between scenes. Even if the genre is "minimal," vary the pad and
+      percussion keywords (e.g., switch from `sparse_perc` to `minimal`).
+    - **Energy Span:** Aim for a wide energy span (at least 0.7-0.8
+      difference between Ambient and Peak) to maximize the "Energy Arc"
+      score.
+    - **JSON Precision:** Ensure the `slot` indices are unique and sequential
+      (e.g., 0, 1, 2, 3, 4, 5).
+
+    ### EXAMPLE PAYLOAD (STRICT FORMAT)
+    ```python
+    import json
+    scene = {
+      "name": "Zenith",
+      "slot": 2,
+      "bars": 8,
+      "energy": 0.9,
+      "key": "Gm",
+      "chords": ["Gm", "Ebmaj7", "Cm7", "D7"],
+      "drums": "four_on_floor",
+      "bass": "rolling_16th",
+      "pad": "pulsing"
+    }
+    write_clip(json.dumps(scene))
+    ```
     """
 
     brief: str = dspy.InputField(
@@ -154,6 +195,32 @@ class LiveCompose(dspy.Signature):
         description="Summary of the live performance: tempo, tracks, sections composed "
         "with timestamps and energy arc, total duration, key creative decisions"
     )
+
+
+# ---------------------------------------------------------------------------
+# Optimized signature loading (GEPA)
+# ---------------------------------------------------------------------------
+
+
+def load_optimized_signature(path="./output/gepa/best_instructions.json"):
+    """Load GEPA-optimized instructions and patch the Compose signature.
+
+    Args:
+        path: Path to the JSON file saved by optimize_compose.py.
+
+    Returns:
+        The optimized instructions string, or None if loading failed.
+    """
+    try:
+        with open(path) as f:
+            data = json.load(f)
+        instructions = data.get("instructions")
+        if instructions:
+            Compose.__doc__ = instructions
+            return instructions
+    except (FileNotFoundError, json.JSONDecodeError, KeyError) as e:
+        print(f"  [WARNING] Could not load optimized signature from {path}: {e}")
+    return None
 
 
 # ---------------------------------------------------------------------------
