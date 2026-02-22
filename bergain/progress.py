@@ -72,6 +72,16 @@ class ProgressState:
     # Analysis results
     analysis: dict[str, Any] = field(default_factory=dict)
 
+    # RLM stream log — tools/patches append, TUI reads
+    stream: list[dict] = field(default_factory=list)
+
+    # Steering — TUI writes, compose_next reads and clears
+    steer_direction: str = ""
+
+    # Control — TUI writes, worker checks
+    paused: bool = False
+    abort: bool = False
+
 
 # ---------------------------------------------------------------------------
 # ProgressDisplay — background daemon thread

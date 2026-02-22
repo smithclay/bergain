@@ -685,3 +685,31 @@ def test_progress_compose_next_updates(session):
     assert state.latest_creative_prompt == "open with atmosphere"
     assert state.latest_sub_lm_response != ""
     assert state.elapsed_min > 0
+
+
+# ---------------------------------------------------------------------------
+# ProgressState TUI fields
+# ---------------------------------------------------------------------------
+
+
+def test_progress_state_stream_default():
+    state = ProgressState()
+    assert state.stream == []
+    assert state.steer_direction == ""
+    assert state.paused is False
+    assert state.abort is False
+
+
+def test_progress_state_stream_append():
+    state = ProgressState()
+    state.stream.append({"type": "step", "content": "test", "timestamp": 1.0})
+    assert len(state.stream) == 1
+    assert state.stream[0]["type"] == "step"
+
+
+def test_progress_state_steer_direction():
+    state = ProgressState()
+    state.steer_direction = "more energy"
+    assert state.steer_direction == "more energy"
+    state.steer_direction = ""
+    assert state.steer_direction == ""
