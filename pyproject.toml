@@ -11,6 +11,7 @@ dependencies = [
     "dspy>=2.6",
     "python-dotenv>=1.0",
     "rich>=13.0",
+    "textual>=1.0",
 ]
 
 [project.scripts]
@@ -26,3 +27,8 @@ packages = ["bergain"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+]
