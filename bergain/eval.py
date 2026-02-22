@@ -51,13 +51,26 @@ def wrap_tools_for_eval(tools):
 
             @functools.wraps(original)
             def _recording_write_clip(clip_json, _orig=original):
-                # Clear on first call per evaluation (detected by empty store)
+                result = _orig(clip_json)
+
+                # Record only successful writes; failed tool calls return {"error": ...}.
+                is_error = False
+                if isinstance(result, str):
+                    try:
+                        payload = json.loads(result)
+                        is_error = isinstance(payload, dict) and "error" in payload
+                    except json.JSONDecodeError:
+                        pass
+
+                if is_error:
+                    return result
+
                 try:
                     spec = json.loads(clip_json)
                     _record_clip(spec)
                 except (json.JSONDecodeError, TypeError):
                     pass
-                return _orig(clip_json)
+                return result
 
             tools[i] = _recording_write_clip
             break

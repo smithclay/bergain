@@ -8,6 +8,7 @@ import json
 import dspy
 
 from bergain.eval import (
+    _get_and_clear_recorded_clips,
     WEIGHTS,
     extract_clips_from_trajectory,
     extract_tool_calls,
@@ -19,6 +20,7 @@ from bergain.eval import (
     score_energy_arc,
     score_variety,
     structural_metric,
+    wrap_tools_for_eval,
 )
 
 
@@ -152,6 +154,46 @@ def test_extract_tool_calls_empty():
     pred = FakePrediction([])
     calls = extract_tool_calls(pred)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# wrap_tools_for_eval tests
+# ---------------------------------------------------------------------------
+
+
+def test_wrap_tools_records_only_successful_write_clip():
+    _get_and_clear_recorded_clips()
+
+    def write_clip(clip_json):
+        return '{"clip":"ok","clips_created":1}'
+
+    tools = [write_clip]
+    wrap_tools_for_eval(tools)
+    wrapped = tools[0]
+
+    spec = '{"name":"Good","slot":0,"bars":4,"energy":0.4}'
+    result = wrapped(spec)
+    recorded = _get_and_clear_recorded_clips()
+
+    assert "error" not in result
+    assert len(recorded) == 1
+    assert recorded[0]["name"] == "Good"
+
+
+def test_wrap_tools_skips_failed_write_clip():
+    _get_and_clear_recorded_clips()
+
+    def write_clip(clip_json):
+        return '{"error":"missing bars"}'
+
+    tools = [write_clip]
+    wrap_tools_for_eval(tools)
+    wrapped = tools[0]
+
+    wrapped('{"name":"Bad"}')
+    recorded = _get_and_clear_recorded_clips()
+
+    assert recorded == []
 
 
 # ---------------------------------------------------------------------------

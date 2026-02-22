@@ -21,11 +21,13 @@ Usage:
 import argparse
 import json
 import os
+import pickle
 import sys
 import time
 
 # Unbuffered stdout so progress is visible in real time
-sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -70,7 +72,7 @@ def _build_student(stub=True, max_iterations=30, max_llm_calls=40, min_clips=6):
     if session is None:
         raise ValueError("Live session not supported in optimization — use stub=True")
 
-    tools, _, _ = make_tools(session, min_clips=min_clips)
+    tools, _, _, _, _ = make_tools(session, min_clips=min_clips)
     wrap_tools_for_eval(tools)
 
     composer = dspy.RLM(
@@ -171,6 +173,96 @@ def _run_baseline(student, briefs, judge_lm=None, max_iterations=30):
     return scores
 
 
+def _read_signature_instructions(signature):
+    """Return non-empty instruction text from a DSPy signature, if present."""
+    if signature is None:
+        return None
+    for attr in ("instructions", "__doc__"):
+        value = getattr(signature, attr, None)
+        if isinstance(value, str) and value.strip():
+            return value
+    return None
+
+
+def _pick_best_candidate_index(state, num_candidates):
+    """Pick the best candidate index from GEPA state metadata."""
+
+    def _as_int(value):
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    for key in ("best_program_id", "best_candidate_id", "best_program_idx", "best_id"):
+        idx = _as_int(state.get(key))
+        if idx is not None and 0 <= idx < num_candidates:
+            return idx
+
+    for key in ("pareto_front", "pareto_front_ids"):
+        front = state.get(key)
+        if not isinstance(front, (list, tuple)):
+            continue
+        for item in front:
+            if isinstance(item, int):
+                idx = item
+            elif isinstance(item, dict):
+                idx = _as_int(
+                    item.get("program_id") or item.get("id") or item.get("candidate_id")
+                )
+            else:
+                idx = None
+            if idx is not None and 0 <= idx < num_candidates:
+                return idx
+
+    return num_candidates - 1
+
+
+def _extract_optimized_instructions(result, output_dir):
+    """Extract optimized instructions from compiled RLM or GEPA state file."""
+    for predictor_name in ("generate_action", "generate", "extract"):
+        predictor = getattr(result, predictor_name, None)
+        signature = getattr(predictor, "signature", None)
+        instructions = _read_signature_instructions(signature)
+        if instructions:
+            return instructions, f"result.{predictor_name}.signature"
+
+    state_path = os.path.join(output_dir, "logs", "gepa_state.bin")
+    if not os.path.exists(state_path):
+        return None, None
+
+    try:
+        with open(state_path, "rb") as f:
+            state = pickle.load(f)
+    except Exception as e:
+        print(f"  WARNING: Could not read GEPA state at {state_path}: {e}")
+        return None, None
+
+    if not isinstance(state, dict):
+        return None, None
+
+    candidates = state.get("program_candidates")
+    if isinstance(candidates, list) and candidates:
+        idx = _pick_best_candidate_index(state, len(candidates))
+        candidate = candidates[idx]
+        if isinstance(candidate, dict):
+            for key in ("generate_action", "generate", "instructions"):
+                instructions = candidate.get(key)
+                if isinstance(instructions, str) and instructions.strip():
+                    return (
+                        instructions,
+                        f"gepa_state.bin:program_candidates[{idx}].{key}",
+                    )
+
+    best_program = state.get("best_program")
+    if isinstance(best_program, dict):
+        for key in ("generate_action", "generate", "instructions"):
+            instructions = best_program.get(key)
+            if isinstance(instructions, str) and instructions.strip():
+                return instructions, f"gepa_state.bin:best_program.{key}"
+
+    return None, None
+
+
 def _run_optimization(
     student,
     budget,
@@ -218,15 +310,9 @@ def _run_optimization(
     os.makedirs(output_dir, exist_ok=True)
 
     # Extract optimized instructions
-    optimized_instructions = None
-    try:
-        # Access the optimized signature's docstring
-        optimized_instructions = result.generate.signature.instructions
-    except AttributeError:
-        try:
-            optimized_instructions = result.generate.signature.__doc__
-        except AttributeError:
-            print("  WARNING: Could not extract optimized instructions")
+    optimized_instructions, instructions_source = _extract_optimized_instructions(
+        result, output_dir
+    )
 
     if optimized_instructions:
         output_path = os.path.join(output_dir, "best_instructions.json")
@@ -243,12 +329,16 @@ def _run_optimization(
                 indent=2,
             )
         print(f"  Saved: {output_path}")
+        if instructions_source:
+            print(f"  Source: {instructions_source}")
 
         # Print diff summary
-        print(f"\n  Original instructions: {len(Compose.__doc__)} chars")
+        print(f"\n  Original instructions: {len(Compose.__doc__ or '')} chars")
         print(f"  Optimized instructions: {len(optimized_instructions)} chars")
         print("\n  Optimized instructions preview (first 500 chars):")
         print(f"    {optimized_instructions[:500]}...")
+    else:
+        print("  WARNING: Could not extract optimized instructions")
 
     return result
 
@@ -336,7 +426,9 @@ def main():
     )
     parser.add_argument(
         "--model",
-        default=os.environ.get("BERGAIN_MODEL", "openrouter/openai/gpt-5"),
+        default=os.environ.get(
+            "BERGAIN_MODEL", "openrouter/google/gemini-3-flash-preview"
+        ),
         help="Task LM model string",
     )
     parser.add_argument(

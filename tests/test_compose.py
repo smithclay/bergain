@@ -1,12 +1,10 @@
-"""Validation tests for compose — renderers, tools, and live mode.
+"""Validation tests for compose — renderers, tools, and palette mode.
 
 Runs without Ableton: uses a stub Session that records calls.
     uv run python -m pytest tests/ -v
 """
 
 import json
-import time
-from unittest.mock import MagicMock
 
 import pytest
 
@@ -39,22 +37,6 @@ def _setup_tracks(tools_by_name):
                 {"name": "Bass", "instrument": "Operator"},
                 {"name": "Pad", "sound": "Warm Pad"},
             ]
-        )
-    )
-
-
-def _setup_tracks_live(tools_by_name):
-    """Use setup_session (live mode) to populate _track_roles and start playback."""
-    tools_by_name["setup_session"](
-        json.dumps(
-            {
-                "tempo": 120,
-                "tracks": [
-                    {"name": "Drums", "role": "drums"},
-                    {"name": "Bass", "role": "bass"},
-                    {"name": "Pad", "role": "pad"},
-                ],
-            }
         )
     )
 
@@ -158,7 +140,7 @@ def test_render_bass_no_chords_uses_key_root():
     ],
 )
 def test_write_clip_style_combos(session, drums, bass, pad):
-    _, tools_by_name, _ = make_tools(session, min_clips=1)
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1)
     _setup_tracks(tools_by_name)
 
     result = json.loads(
@@ -188,250 +170,13 @@ def test_write_clip_style_combos(session, drums, bass, pad):
 
 
 # ---------------------------------------------------------------------------
-# get_arc_summary tests
+# ready_to_submit palette mode
 # ---------------------------------------------------------------------------
 
 
-def test_arc_summary_empty(session):
-    _, tools_by_name, _ = make_tools(session, live_mode=True, duration_minutes=10)
-    result = json.loads(tools_by_name["get_arc_summary"]())
-    assert result["sections"] == 0
-
-
-def test_arc_summary_after_sections(session):
-    """Simulate history via compose_next's internal list, then check arc."""
-    _, tools_by_name, _ = make_tools(
-        session, live_mode=True, duration_minutes=10, sub_lm=None, brief="test"
-    )
-    _setup_tracks_live(tools_by_name)
-
-    # Manually populate _live_history via write_clip + direct list access
-    # We'll use write_clip to bump clip count, then check arc is still empty
-    # (compose_next populates _live_history, not write_clip)
-    result = json.loads(tools_by_name["get_arc_summary"]())
-    assert result["sections"] == 0
-
-
-# ---------------------------------------------------------------------------
-# compose_next tests (mock sub_lm)
-# ---------------------------------------------------------------------------
-
-
-def _make_mock_sub_lm(section_json):
-    """Return a callable that mimics dspy.LM returning a JSON string."""
-    mock = MagicMock()
-    mock.return_value = [json.dumps(section_json)]
-    return mock
-
-
-def test_compose_next_basic(session):
-    section = {
-        "name": "Gentle Opening",
-        "slot": 0,
-        "bars": 4,
-        "energy": 0.3,
-        "key": "Eb",
-        "chords": ["Ebmaj7"],
-        "drums": "minimal",
-        "bass": "none",
-        "pad": "atmospheric",
-    }
-    mock_lm = _make_mock_sub_lm(section)
-
-    _, tools_by_name, _ = make_tools(
-        session,
-        live_mode=True,
-        duration_minutes=10,
-        sub_lm=mock_lm,
-        brief="Test lullaby",
-    )
-    _setup_tracks_live(tools_by_name)
-
-    result = json.loads(tools_by_name["compose_next"]("Open with soft atmosphere"))
-
-    assert "error" not in result
-    assert result["composed"] == "Gentle Opening"
-    assert result["energy"] == 0.3
-    assert result["sections_so_far"] == 1
-    mock_lm.assert_called_once()
-
-    # Verify the prompt sent to sub_lm does NOT contain exact param values
-    call_args = mock_lm.call_args
-    prompt_sent = call_args[1]["messages"][0]["content"]
-    assert "Open with soft atmosphere" in prompt_sent
-    assert "Test lullaby" in prompt_sent
-
-
-def test_compose_next_no_sub_lm(session):
-    """compose_next without sub_lm should return an error, not crash."""
-    _, tools_by_name, _ = make_tools(session, live_mode=True, sub_lm=None)
-    result = json.loads(tools_by_name["compose_next"]("anything"))
-    assert "error" in result
-
-
-def test_compose_next_bad_json_from_lm(session):
-    """Sub-LM returning garbage should produce an error, not crash."""
-    mock_lm = MagicMock(return_value=["This is not JSON at all!"])
-    _, tools_by_name, _ = make_tools(
-        session, live_mode=True, duration_minutes=10, sub_lm=mock_lm, brief="test"
-    )
-    _setup_tracks_live(tools_by_name)
-
-    result = json.loads(tools_by_name["compose_next"]("do something"))
-    assert "error" in result
-
-
-def test_compose_next_history_compression(session):
-    """After >5 sections, compose_next should compress earlier history."""
-    sections = [
-        {
-            "name": f"S{i}",
-            "slot": i,
-            "bars": 4,
-            "energy": 0.1 * i,
-            "key": "C",
-            "chords": ["Cm"],
-            "drums": "minimal",
-            "bass": "sustained",
-            "pad": "sustained",
-        }
-        for i in range(8)
-    ]
-    call_count = [0]
-
-    def mock_lm_sequence(messages, **kwargs):
-        idx = min(call_count[0], len(sections) - 1)
-        call_count[0] += 1
-        return [json.dumps(sections[idx])]
-
-    mock_lm = MagicMock(side_effect=mock_lm_sequence)
-    _, tools_by_name, _ = make_tools(
-        session, live_mode=True, duration_minutes=60, sub_lm=mock_lm, brief="test"
-    )
-    _setup_tracks_live(tools_by_name)
-
-    # Compose 7 sections
-    for i in range(7):
-        tools_by_name["compose_next"](f"section {i}")
-
-    # 8th call — history should be compressed (5 recent + summary of 2 earlier)
-    tools_by_name["compose_next"]("section 7")
-    last_call = mock_lm.call_args
-    prompt_sent = last_call[1]["messages"][0]["content"]
-    assert "Earlier (" in prompt_sent, "Expected compressed history summary"
-
-
-def test_compose_next_overused_combo_warning(session):
-    """After 3+ uses of same combo, sub-LM prompt should warn."""
-    same_section = {
-        "name": "Repeat",
-        "slot": 0,
-        "bars": 4,
-        "energy": 0.5,
-        "key": "C",
-        "chords": ["Cm"],
-        "drums": "minimal",
-        "bass": "sustained",
-        "pad": "sustained",
-    }
-    call_count = [0]
-
-    def mock_lm_fn(messages, **kwargs):
-        s = dict(same_section)
-        s["slot"] = call_count[0]
-        call_count[0] += 1
-        return [json.dumps(s)]
-
-    mock_lm = MagicMock(side_effect=mock_lm_fn)
-    _, tools_by_name, _ = make_tools(
-        session, live_mode=True, duration_minutes=60, sub_lm=mock_lm, brief="test"
-    )
-    _setup_tracks_live(tools_by_name)
-
-    for i in range(4):
-        tools_by_name["compose_next"](f"step {i}")
-
-    last_prompt = mock_lm.call_args[1]["messages"][0]["content"]
-    assert "OVERUSED" in last_prompt, (
-        "Expected overuse warning after 3 identical combos"
-    )
-
-
-# ---------------------------------------------------------------------------
-# Arc phase guidance in compose_next
-# ---------------------------------------------------------------------------
-
-
-def test_compose_next_arc_phases(session):
-    """Prompt should reflect opening/middle/final phase based on elapsed time."""
-    section = {
-        "name": "X",
-        "slot": 0,
-        "bars": 4,
-        "energy": 0.5,
-        "key": "C",
-        "chords": ["Cm"],
-        "drums": "minimal",
-        "bass": "none",
-        "pad": "sustained",
-    }
-    call_count = [0]
-
-    def mock_lm_fn(messages, **kwargs):
-        s = dict(section)
-        s["slot"] = call_count[0]
-        call_count[0] += 1
-        return [json.dumps(s)]
-
-    mock_lm = MagicMock(side_effect=mock_lm_fn)
-    # 3-minute target so phases are at 1/2/3 min boundaries
-    _, tools_by_name, _ = make_tools(
-        session, live_mode=True, duration_minutes=3, sub_lm=mock_lm, brief="test"
-    )
-    _setup_tracks_live(tools_by_name)
-
-    # First call — should be "OPENING"
-    tools_by_name["compose_next"]("intro")
-    prompt = mock_lm.call_args[1]["messages"][0]["content"]
-    assert "OPENING" in prompt
-
-
-# ---------------------------------------------------------------------------
-# ready_to_submit live mode
-# ---------------------------------------------------------------------------
-
-
-def test_ready_to_submit_live_mode_too_early(session):
-    _, tools_by_name, _ = make_tools(
-        session, min_clips=1, live_mode=True, duration_minutes=60
-    )
-    _setup_tracks_live(tools_by_name)
-
-    # Write enough clips
-    tools_by_name["write_clip"](
-        json.dumps(
-            {
-                "name": "Test",
-                "slot": 0,
-                "bars": 4,
-                "energy": 0.5,
-                "key": "C",
-                "chords": ["Cm"],
-                "drums": "minimal",
-                "bass": "sustained",
-                "pad": "sustained",
-            }
-        )
-    )
-
-    result = tools_by_name["ready_to_submit"]()
-    assert "NOT READY" in result
-    assert "elapsed" in result.lower()
-
-
-def test_ready_to_submit_palette_unchanged(session):
-    """Palette mode should still require mix and status checks."""
-    _, tools_by_name, _ = make_tools(session, min_clips=1, live_mode=False)
+def test_ready_to_submit_palette(session):
+    """Palette mode should require mix and status checks."""
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1)
     _setup_tracks(tools_by_name)
 
     tools_by_name["browse"]("test")
@@ -458,51 +203,69 @@ def test_ready_to_submit_palette_unchanged(session):
 
 
 # ---------------------------------------------------------------------------
-# wait / elapsed
-# ---------------------------------------------------------------------------
-
-
-def test_elapsed_before_play(session):
-    _, tools_by_name, _ = make_tools(session, live_mode=True, duration_minutes=10)
-    result = json.loads(tools_by_name["elapsed"]())
-    assert result["elapsed_minutes"] == 0
-    assert "Timer starts" in result.get("note", "")
-
-
-def test_elapsed_after_play(session):
-    _, tools_by_name, _ = make_tools(session, live_mode=True, duration_minutes=10)
-    _setup_tracks_live(tools_by_name)  # setup_session starts playback
-    # Sleep long enough that rounding to 1 decimal still shows > 0
-    time.sleep(7)  # 7s = 0.117 min → rounds to 0.1
-
-    result = json.loads(tools_by_name["elapsed"]())
-    assert result["elapsed_minutes"] > 0
-    assert result["remaining_minutes"] < 10
-    assert result["target_minutes"] == 10
-    assert "note" not in result  # timer should be started, no "Timer starts" note
-
-
-# ---------------------------------------------------------------------------
 # Tool list composition
 # ---------------------------------------------------------------------------
 
 
-def test_live_tools_include_live_only(session):
-    tools, _, _ = make_tools(session, live_mode=True, duration_minutes=10)
+def test_palette_tools_include_expected(session):
+    tools, _, _, _, _ = make_tools(session)
     names = {t.__name__ for t in tools}
-    assert "wait" in names
-    assert "elapsed" in names
-    assert "compose_next" in names
-    assert "get_arc_summary" in names
+    assert "browse" in names
+    assert "create_tracks" in names
+    assert "write_clip" in names
+    assert "set_mix" in names
+    assert "ready_to_submit" in names
 
 
 def test_palette_tools_exclude_live_only(session):
-    tools, _, _ = make_tools(session, live_mode=False)
+    tools, _, _, _, _ = make_tools(session)
     names = {t.__name__ for t in tools}
     assert "wait" not in names
     assert "elapsed" not in names
     assert "compose_next" not in names
     assert "get_arc_summary" not in names
+
+
+# ---------------------------------------------------------------------------
+# Palette scene capture
+# ---------------------------------------------------------------------------
+
+
+def test_write_clip_captures_palette_scenes(session):
+    """write_clip should capture scene data in _palette_scenes."""
+    _, tools_by_name, _, _, palette_scenes = make_tools(session, min_clips=1)
+    _setup_tracks(tools_by_name)
+
+    tools_by_name["write_clip"](
+        json.dumps(
+            {
+                "name": "Intro",
+                "slot": 0,
+                "bars": 8,
+                "energy": 0.2,
+                "key": "F",
+                "chords": ["Fm", "Cm7"],
+                "drums": "minimal",
+                "bass": "none",
+                "pad": "atmospheric",
+            }
+        )
+    )
+
+    assert len(palette_scenes) == 1
+    assert palette_scenes[0]["name"] == "Intro"
+    assert palette_scenes[0]["energy"] == 0.2
+    assert palette_scenes[0]["key"] == "F"
+
+
+def test_track_roles_returned(session):
+    """make_tools should return track_roles dict."""
+    _, tools_by_name, _, track_roles, _ = make_tools(session, min_clips=1)
+    _setup_tracks(tools_by_name)
+
+    assert track_roles["Drums"] == "drums"
+    assert track_roles["Bass"] == "bass"
+    assert track_roles["Pad"] == "pad"
 
 
 # ---------------------------------------------------------------------------
@@ -512,7 +275,7 @@ def test_palette_tools_exclude_live_only(session):
 
 def test_progress_browse_done(session):
     state = ProgressState()
-    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1, progress=state)
     assert not state.browse_done
     tools_by_name["browse"]("test")
     assert state.browse_done
@@ -520,7 +283,7 @@ def test_progress_browse_done(session):
 
 def test_progress_tracks_done(session):
     state = ProgressState()
-    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1, progress=state)
     assert not state.tracks_done
     _setup_tracks(tools_by_name)
     assert state.tracks_done
@@ -528,7 +291,7 @@ def test_progress_tracks_done(session):
 
 def test_progress_clips_created(session):
     state = ProgressState()
-    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1, progress=state)
     _setup_tracks(tools_by_name)
     assert state.clips_created == 0
     tools_by_name["write_clip"](
@@ -551,71 +314,8 @@ def test_progress_clips_created(session):
 
 def test_progress_mix_done(session):
     state = ProgressState()
-    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1, progress=state)
     _setup_tracks(tools_by_name)
     assert not state.mix_done
     tools_by_name["set_mix"](json.dumps({"Drums": 0.9}))
     assert state.mix_done
-
-
-def test_progress_start_time_on_play(session):
-    state = ProgressState()
-    _, tools_by_name, _ = make_tools(
-        session, min_clips=1, live_mode=True, duration_minutes=10, progress=state
-    )
-    assert state.start_time is None
-    _setup_tracks_live(tools_by_name)  # setup_session starts playback + sets start_time
-    assert state.start_time is not None
-
-
-def test_progress_setup_session_updates(session):
-    state = ProgressState()
-    _, tools_by_name, _ = make_tools(
-        session, min_clips=1, live_mode=True, duration_minutes=10, progress=state
-    )
-    tools_by_name["setup_session"](
-        json.dumps(
-            {
-                "tempo": 120,
-                "tracks": [
-                    {"name": "Drums", "role": "drums"},
-                    {"name": "Bass", "role": "bass"},
-                ],
-            }
-        )
-    )
-    assert state.browse_done
-    assert state.tracks_done
-    assert state.start_time is not None
-
-
-def test_progress_compose_next_updates(session):
-    state = ProgressState()
-    section = {
-        "name": "Test Section",
-        "slot": 0,
-        "bars": 4,
-        "energy": 0.4,
-        "key": "C",
-        "chords": ["Cm"],
-        "drums": "minimal",
-        "bass": "none",
-        "pad": "atmospheric",
-    }
-    mock_lm = _make_mock_sub_lm(section)
-    _, tools_by_name, _ = make_tools(
-        session,
-        live_mode=True,
-        duration_minutes=10,
-        sub_lm=mock_lm,
-        brief="test",
-        progress=state,
-    )
-    _setup_tracks_live(tools_by_name)
-
-    tools_by_name["compose_next"]("open with atmosphere")
-
-    assert len(state.sections) == 1
-    assert state.latest_creative_prompt == "open with atmosphere"
-    assert state.latest_sub_lm_response != ""
-    assert state.elapsed_min > 0

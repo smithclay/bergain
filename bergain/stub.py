@@ -4,15 +4,40 @@ Records calls without needing Ableton — used by tests and GEPA optimization.
 """
 
 
+class _StubDomainProxy:
+    """Mock for api.song, api.track(n), etc."""
+
+    def __init__(self, data=None):
+        self._data = data or {}
+
+    def get(self, key):
+        return self._data.get(key)
+
+    def call(self, method, *args):
+        pass
+
+
+class _StubAPI:
+    """Mock for session.api — provides song and track proxies."""
+
+    def __init__(self, tempo=120, num_scenes=8):
+        self.song = _StubDomainProxy({"tempo": tempo, "num_scenes": num_scenes})
+
+    def track(self, index):
+        return _StubDomainProxy({"volume": 0.85})
+
+
 class StubSession:
     """Minimal session substitute that logs calls without Ableton."""
 
     def __init__(self, tempo=120):
         self._tempo = tempo
         self.calls = []
+        self.api = _StubAPI(tempo=tempo)
 
     def tempo(self, bpm):
         self._tempo = bpm
+        self.api.song._data["tempo"] = bpm
         self.calls.append(("tempo", bpm))
 
     def status(self):
@@ -43,6 +68,13 @@ class StubSession:
 
     def stop(self):
         self.calls.append(("stop",))
+
+    def fade(self, track, target, steps=4, duration=1.0):
+        self.calls.append(("fade", track, target))
+
+    def _t(self, track_name):
+        """Resolve track name to index (stub always returns 0)."""
+        return 0
 
     def load_instrument(self, track, name):
         return name

@@ -408,3 +408,64 @@ def render_pads(
                 notes.append((p, chord_start + mid, mid, vel_peak))
 
     return notes
+
+
+# ---------------------------------------------------------------------------
+# Shared clip rendering — used by tools.py write_clip and evolve.py _write_clips
+# ---------------------------------------------------------------------------
+
+# Role → style keys in the section dict
+STYLE_KEYS = ("drums", "bass", "pad", "stab", "texture")
+
+
+def render_role(role, style, bars, energy, chords, key_root, section_name):
+    """Render notes for a single track role.
+
+    Returns a list of (pitch, start, duration, velocity) tuples, already
+    clamped to valid MIDI ranges. Returns [] if style is "none".
+    """
+    if style == "none":
+        return []
+
+    if role == "drums":
+        raw = render_drums(bars, energy, style, section_name=section_name)
+    elif role == "bass":
+        raw = render_bass(
+            bars, energy, style, chords, key_root, section_name=section_name
+        )
+    elif role == "pad":
+        raw = render_pads(
+            bars, energy, style, chords, key_root, section_name=section_name
+        )
+    elif role == "stab":
+        raw = render_pads(
+            bars,
+            energy,
+            style,
+            chords,
+            key_root,
+            section_name=f"Stab {section_name}",
+        )
+        # Stab post-processing: pitch +12, duration *0.5, velocity +15
+        raw = [(min(127, p + 12), s, d * 0.5, min(127, v + 15)) for p, s, d, v in raw]
+    elif role == "texture":
+        raw = render_pads(
+            bars,
+            energy,
+            style,
+            chords,
+            key_root,
+            section_name=f"Texture {section_name}",
+        )
+        # Texture post-processing: pitch -12 (floor 0), velocity -20
+        raw = [(max(0, p - 12), s, d, max(1, v - 20)) for p, s, d, v in raw]
+    else:
+        return []
+
+    return [clamp_note(n) for n in raw]
+
+
+def _clip_name_for_role(role, section_name):
+    """Return the clip display name for a given role and section."""
+    prefix = role.capitalize()
+    return f"{prefix} {section_name}"
