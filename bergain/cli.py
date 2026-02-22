@@ -304,7 +304,7 @@ def _print_summary(report):
 # ---------------------------------------------------------------------------
 
 
-def cmd_compose(args):
+def cmd_compose(args, progress_override=None):
     """Run the full compose pipeline: compose -> export -> analyze -> report."""
     from .compose import Compose, LiveCompose, _slugify
     from .progress import PlainProgress, ProgressDisplay, ProgressState
@@ -341,17 +341,25 @@ def cmd_compose(args):
     mode_label = f"LIVE ({args.duration} min)" if args.live else "PALETTE"
 
     # Progress state + display
-    state = ProgressState(
-        brief=brief,
-        live=args.live,
-        duration=args.duration,
-        model=args.model,
-    )
-
-    if args.no_progress:
-        display = PlainProgress(state)
+    if progress_override:
+        state = progress_override
+        state.brief = brief
+        state.live = args.live
+        state.duration = args.duration
+        state.model = args.model
+        display = PlainProgress(state)  # TUI handles real display
     else:
-        display = ProgressDisplay(state)
+        state = ProgressState(
+            brief=brief,
+            live=args.live,
+            duration=args.duration,
+            model=args.model,
+        )
+
+        if args.no_progress:
+            display = PlainProgress(state)
+        else:
+            display = ProgressDisplay(state)
 
     # Configure LMs — patch to show reasoning + heartbeat
     lm = _patch_reasoning(dspy.LM(args.model, cache=False), label="DJ", progress=state)
