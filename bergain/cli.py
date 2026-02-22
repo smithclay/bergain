@@ -526,6 +526,20 @@ def main():
         return
 
     args = _parse_args()
+
+    # No brief and no brief-file → launch TUI
+    if not args.brief and not args.brief_file:
+        try:
+            from .tui import BergainApp
+
+            BergainApp().run()
+        except ImportError:
+            print("Error: textual is required for TUI mode.")
+            print("Install with: uv add textual")
+            sys.exit(1)
+        return
+
+    # Has brief → headless compose (existing behavior)
     cmd_compose(args)
 
 
