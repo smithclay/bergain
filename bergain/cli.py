@@ -67,6 +67,29 @@ def _patch_reasoning(lm, label="DJ", progress=None):
                 progress.llm_calls += 1
                 progress.llm_tokens += tokens_this_call
 
+                # Append to stream log for TUI
+                import time as _time
+
+                progress.stream.append(
+                    {
+                        "type": "step",
+                        "content": f"[{label} step {step_counter[0]}]"
+                        + (f" ({tokens_this_call:,} tok)" if tokens_this_call else ""),
+                        "timestamp": _time.time(),
+                    }
+                )
+                if reasoning:
+                    text_for_stream = reasoning.strip()
+                    if len(text_for_stream) > 800:
+                        text_for_stream = text_for_stream[:800] + "..."
+                    progress.stream.append(
+                        {
+                            "type": "reasoning",
+                            "content": text_for_stream,
+                            "timestamp": _time.time(),
+                        }
+                    )
+
             # Print reasoning block
             if reasoning:
                 text = reasoning.strip()

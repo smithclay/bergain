@@ -713,3 +713,32 @@ def test_progress_state_steer_direction():
     assert state.steer_direction == "more energy"
     state.steer_direction = ""
     assert state.steer_direction == ""
+
+
+def test_tool_results_stream_to_progress(session):
+    """Tool calls should append result entries to progress.stream."""
+    state = ProgressState()
+    _, tools_by_name, _ = make_tools(session, min_clips=1, progress=state)
+    _setup_tracks(tools_by_name)
+
+    # Clear stream entries from setup
+    state.stream.clear()
+
+    tools_by_name["write_clip"](
+        json.dumps(
+            {
+                "name": "Test",
+                "slot": 0,
+                "bars": 4,
+                "energy": 0.5,
+                "key": "C",
+                "chords": ["Cm"],
+                "drums": "minimal",
+                "bass": "sustained",
+                "pad": "sustained",
+            }
+        )
+    )
+
+    types = [e["type"] for e in state.stream]
+    assert "result" in types
