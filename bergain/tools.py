@@ -884,6 +884,27 @@ def make_tools(
                     }
                 )
 
+        # Inject steering direction from TUI
+        if progress and progress.steer_direction:
+            creative_prompt = f"{progress.steer_direction}. {creative_prompt}"
+            progress.stream.append(
+                {
+                    "type": "steer",
+                    "content": progress.steer_direction,
+                    "timestamp": time.time(),
+                }
+            )
+            progress.steer_direction = ""
+
+        # Pause gate — wait while paused
+        if progress:
+            while progress.paused and not progress.abort:
+                time.sleep(0.5)
+
+        # Abort check
+        if progress and progress.abort:
+            return json.dumps({"error": "Aborted from TUI"})
+
         next_slot = max((h["slot"] for h in _live_history), default=-1) + 1
         prompt = _build_compose_prompt(creative_prompt, next_slot)
 
@@ -971,6 +992,16 @@ def make_tools(
             if section["bars"] > max_bars_remaining:
                 guardrails_applied.append(f"time_cap_{max_bars_remaining}_bars")
                 section["bars"] = max_bars_remaining
+
+        # Stream guardrail info
+        if progress and guardrails_applied:
+            progress.stream.append(
+                {
+                    "type": "guardrail",
+                    "content": ", ".join(guardrails_applied),
+                    "timestamp": time.time(),
+                }
+            )
 
         section.setdefault("key", "C")
         section.setdefault("chords", [section["key"] + "m7"])

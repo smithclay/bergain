@@ -742,3 +742,111 @@ def test_tool_results_stream_to_progress(session):
 
     types = [e["type"] for e in state.stream]
     assert "result" in types
+
+
+def test_compose_next_steer_injection(session):
+    """Steer direction should be prepended to creative_prompt and cleared."""
+    section = {
+        "name": "Steered",
+        "slot": 0,
+        "bars": 4,
+        "energy": 0.6,
+        "key": "F",
+        "chords": ["Fm7"],
+        "drums": "four_on_floor",
+        "bass": "none",
+        "pad": "sustained",
+    }
+    mock_lm = _make_mock_sub_lm(section)
+    state = ProgressState()
+    state.steer_direction = "bring in heavy drums"
+
+    _, tools_by_name, _ = make_tools(
+        session,
+        live_mode=True,
+        duration_minutes=10,
+        sub_lm=mock_lm,
+        brief="test",
+        progress=state,
+    )
+    _setup_tracks_live(tools_by_name)
+
+    tools_by_name["compose_next"]("gentle atmosphere")
+
+    # Steer should have been consumed
+    assert state.steer_direction == ""
+
+    # The sub-LM prompt should contain the steer direction
+    prompt_sent = mock_lm.call_args[1]["messages"][0]["content"]
+    assert "bring in heavy drums" in prompt_sent
+
+    # Stream should have a steer entry
+    steer_entries = [e for e in state.stream if e["type"] == "steer"]
+    assert len(steer_entries) == 1
+    assert "bring in heavy drums" in steer_entries[0]["content"]
+
+
+def test_compose_next_abort(session):
+    """Setting abort=True on progress should return error instead of composing."""
+    section = {
+        "name": "X",
+        "slot": 0,
+        "bars": 4,
+        "energy": 0.5,
+        "key": "C",
+        "chords": ["Cm"],
+        "drums": "minimal",
+        "bass": "none",
+        "pad": "sustained",
+    }
+    mock_lm = _make_mock_sub_lm(section)
+    state = ProgressState()
+    state.abort = True
+
+    _, tools_by_name, _ = make_tools(
+        session,
+        live_mode=True,
+        duration_minutes=10,
+        sub_lm=mock_lm,
+        brief="test",
+        progress=state,
+    )
+    _setup_tracks_live(tools_by_name)
+
+    result = json.loads(tools_by_name["compose_next"]("anything"))
+    assert "error" in result
+    assert "abort" in result["error"].lower()
+
+
+def test_compose_next_guardrail_streams(session):
+    """Guardrails should be appended to progress.stream."""
+    # Energy 0.9 in opening third should be capped to 0.55
+    section = {
+        "name": "TooHot",
+        "slot": 0,
+        "bars": 4,
+        "energy": 0.9,
+        "key": "C",
+        "chords": ["Cm"],
+        "drums": "four_on_floor",
+        "bass": "sustained",
+        "pad": "sustained",
+    }
+    mock_lm = _make_mock_sub_lm(section)
+    state = ProgressState()
+
+    _, tools_by_name, _ = make_tools(
+        session,
+        live_mode=True,
+        duration_minutes=60,
+        sub_lm=mock_lm,
+        brief="test",
+        progress=state,
+    )
+    _setup_tracks_live(tools_by_name)
+
+    tools_by_name["compose_next"]("full power")
+
+    guardrail_entries = [e for e in state.stream if e["type"] == "guardrail"]
+    assert len(guardrail_entries) >= 1
+    assert "opening_cap" in guardrail_entries[0]["content"]
