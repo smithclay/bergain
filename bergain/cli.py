@@ -67,6 +67,29 @@ def _patch_reasoning(lm, label="DJ", progress=None):
                 progress.llm_calls += 1
                 progress.llm_tokens += tokens_this_call
 
+                # Append to stream log for TUI
+                import time as _time
+
+                progress.stream.append(
+                    {
+                        "type": "step",
+                        "content": f"[{label} step {step_counter[0]}]"
+                        + (f" ({tokens_this_call:,} tok)" if tokens_this_call else ""),
+                        "timestamp": _time.time(),
+                    }
+                )
+                if reasoning:
+                    text_for_stream = reasoning.strip()
+                    if len(text_for_stream) > 800:
+                        text_for_stream = text_for_stream[:800] + "..."
+                    progress.stream.append(
+                        {
+                            "type": "reasoning",
+                            "content": text_for_stream,
+                            "timestamp": _time.time(),
+                        }
+                    )
+
             # Print reasoning block
             if reasoning:
                 text = reasoning.strip()
@@ -342,7 +365,7 @@ def _run_evolution_loop(evolver, session, bars_per_cycle, state):
 # ---------------------------------------------------------------------------
 
 
-def cmd_compose(args):
+def cmd_compose(args, progress_override=None):
     """Run the full compose pipeline: compose -> export -> analyze -> report."""
     from .compose import Compose, _slugify, load_optimized_signature
     from .progress import PlainProgress, ProgressDisplay, ProgressState
@@ -387,17 +410,25 @@ def cmd_compose(args):
     mode_label = f"LIVE ({args.duration} min)" if args.live else "PALETTE"
 
     # Progress state + display
-    state = ProgressState(
-        brief=brief,
-        live=args.live,
-        duration=args.duration,
-        model=args.model,
-    )
-
-    if args.no_progress:
-        display = PlainProgress(state)
+    if progress_override:
+        state = progress_override
+        state.brief = brief
+        state.live = args.live
+        state.duration = args.duration
+        state.model = args.model
+        display = PlainProgress(state)  # TUI handles real display
     else:
-        display = ProgressDisplay(state)
+        state = ProgressState(
+            brief=brief,
+            live=args.live,
+            duration=args.duration,
+            model=args.model,
+        )
+
+        if args.no_progress:
+            display = PlainProgress(state)
+        else:
+            display = ProgressDisplay(state)
 
     # Configure LMs — patch to show reasoning + heartbeat
     lm = _patch_reasoning(dspy.LM(args.model, cache=False), label="DJ", progress=state)
@@ -457,8 +488,22 @@ def cmd_compose(args):
         prediction = composer(brief=brief)
     except KeyboardInterrupt:
         print("\n  Interrupted — stopping playback...")
+        state.stream.append(
+            {
+                "type": "step",
+                "content": "Interrupted by user.",
+                "timestamp": time.time(),
+            }
+        )
     except Exception as e:
         print(f"\n  Compose error: {e}")
+        state.stream.append(
+            {
+                "type": "error",
+                "content": f"Compose error: {e}",
+                "timestamp": time.time(),
+            }
+        )
     finally:
         state.phase = "firing"
 
@@ -578,6 +623,20 @@ def main():
         return
 
     args = _parse_args()
+
+    # No brief and no brief-file → launch TUI
+    if not args.brief and not args.brief_file:
+        try:
+            from .tui import BergainApp
+
+            BergainApp().run()
+        except ImportError:
+            print("Error: textual is required for TUI mode.")
+            print("Install with: uv add textual")
+            sys.exit(1)
+        return
+
+    # Has brief → headless compose (existing behavior)
     cmd_compose(args)
 
 

@@ -47,12 +47,33 @@ def make_tools(
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
             try:
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                if progress:
+                    import time as _time
+
+                    progress.stream.append(
+                        {
+                            "type": "result",
+                            "content": f"{fn.__name__}: {result[:200] if isinstance(result, str) else result}",
+                            "timestamp": _time.time(),
+                        }
+                    )
+                return result
             except Exception as e:
                 import traceback
 
                 print(f"  [TOOL ERROR] {fn.__name__}: {type(e).__name__}: {e}")
                 traceback.print_exc()
+                if progress:
+                    import time as _time
+
+                    progress.stream.append(
+                        {
+                            "type": "error",
+                            "content": f"{fn.__name__}: {e}",
+                            "timestamp": _time.time(),
+                        }
+                    )
                 return json.dumps({"error": str(e)})
 
         return wrapper

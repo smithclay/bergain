@@ -319,3 +319,60 @@ def test_progress_mix_done(session):
     assert not state.mix_done
     tools_by_name["set_mix"](json.dumps({"Drums": 0.9}))
     assert state.mix_done
+
+
+# ---------------------------------------------------------------------------
+# ProgressState TUI fields
+# ---------------------------------------------------------------------------
+
+
+def test_progress_state_stream_default():
+    state = ProgressState()
+    assert state.stream == []
+    assert state.steer_direction == ""
+    assert state.paused is False
+    assert state.abort is False
+
+
+def test_progress_state_stream_append():
+    state = ProgressState()
+    state.stream.append({"type": "step", "content": "test", "timestamp": 1.0})
+    assert len(state.stream) == 1
+    assert state.stream[0]["type"] == "step"
+
+
+def test_progress_state_steer_direction():
+    state = ProgressState()
+    state.steer_direction = "more energy"
+    assert state.steer_direction == "more energy"
+    state.steer_direction = ""
+    assert state.steer_direction == ""
+
+
+def test_tool_results_stream_to_progress(session):
+    """Tool calls should append result entries to progress.stream."""
+    state = ProgressState()
+    _, tools_by_name, _, _, _ = make_tools(session, min_clips=1, progress=state)
+    _setup_tracks(tools_by_name)
+
+    # Clear stream entries from setup
+    state.stream.clear()
+
+    tools_by_name["write_clip"](
+        json.dumps(
+            {
+                "name": "Test",
+                "slot": 0,
+                "bars": 4,
+                "energy": 0.5,
+                "key": "C",
+                "chords": ["Cm"],
+                "drums": "minimal",
+                "bass": "sustained",
+                "pad": "sustained",
+            }
+        )
+    )
+
+    types = [e["type"] for e in state.stream]
+    assert "result" in types
