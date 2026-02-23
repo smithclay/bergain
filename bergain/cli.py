@@ -120,7 +120,9 @@ def _parse_args():
     p.add_argument("--brief-file", help="Read brief from a file")
     p.add_argument(
         "--model",
-        default=os.environ.get("BERGAIN_MODEL", "openrouter/openai/gpt-5"),
+        default=os.environ.get(
+            "BERGAIN_MODEL", "openrouter/google/gemini-3-flash-preview"
+        ),
         help="Primary LM (LiteLLM model string)",
     )
     p.add_argument(
@@ -181,6 +183,14 @@ def _parse_args():
         "--output-dir",
         default="./output/compose/",
         help="Directory for output files (trajectory, WAV, report)",
+    )
+    p.add_argument(
+        "--optimized",
+        nargs="?",
+        const="./output/gepa/best_instructions.json",
+        default=None,
+        metavar="PATH",
+        help="Load GEPA-optimized Compose instructions (default path: ./output/gepa/best_instructions.json)",
     )
     return p.parse_args()
 
@@ -300,13 +310,64 @@ def _print_summary(report):
 
 
 # ---------------------------------------------------------------------------
+# Evolution loop — interactive live evolution overlay
+# ---------------------------------------------------------------------------
+
+
+def _run_evolution_loop(evolver, session, bars_per_cycle, state):
+    """Interactive evolution: auto-evolve with optional user input."""
+    import select
+    import sys
+
+    try:
+        bpm = float(session.api.song.get("tempo") or 120)
+    except Exception:
+        bpm = 120
+    bar_sec = 4 * 60.0 / bpm
+    cycle_sec = bars_per_cycle * bar_sec
+
+    print("\n  === LIVE EVOLUTION ===")
+    print("  Type creative directions, or let it auto-evolve.")
+    print("  Press Ctrl+C to stop.\n")
+
+    user_input = None
+    try:
+        while not evolver.should_stop():
+            slot = evolver.next_scene_slot()
+            direction = user_input or evolver.auto_direction()
+            user_input = None
+
+            elapsed, remaining = evolver.get_elapsed()
+            print(f"  [{elapsed:.1f}m] Slot {slot}: {direction[:80]}")
+
+            section = evolver.evolve_section(direction, slot)
+            session.fire(slot)
+            evolver.restore_track_volumes(section)
+
+            # Wait for scene, checking stdin each second
+            deadline = time.time() + cycle_sec
+            while time.time() < deadline:
+                wait = min(1.0, deadline - time.time())
+                if wait <= 0:
+                    break
+                ready, _, _ = select.select([sys.stdin], [], [], wait)
+                if ready:
+                    line = sys.stdin.readline().strip()
+                    if line:
+                        user_input = line
+                        print(f"  [USER] -> {line[:80]}")
+    except KeyboardInterrupt:
+        print("\n  Evolution stopped.")
+
+
+# ---------------------------------------------------------------------------
 # cmd_compose — the main pipeline
 # ---------------------------------------------------------------------------
 
 
 def cmd_compose(args, progress_override=None):
     """Run the full compose pipeline: compose -> export -> analyze -> report."""
-    from .compose import Compose, LiveCompose, _slugify
+    from .compose import Compose, _slugify, load_optimized_signature
     from .progress import PlainProgress, ProgressDisplay, ProgressState
     from .session import Session
     from .tools import make_tools
@@ -337,7 +398,15 @@ def cmd_compose(args, progress_override=None):
     if args.min_clips is None:
         args.min_clips = defaults[2]
 
-    signature = LiveCompose if args.live else Compose
+    # Load GEPA-optimized instructions if requested
+    if args.optimized:
+        loaded = load_optimized_signature(args.optimized)
+        if loaded:
+            print(f"  Loaded optimized Compose instructions from {args.optimized}")
+        else:
+            print("  WARNING: Could not load optimized instructions, using defaults")
+
+    signature = Compose  # Always palette first; --live adds evolution overlay
     mode_label = f"LIVE ({args.duration} min)" if args.live else "PALETTE"
 
     # Progress state + display
@@ -386,13 +455,9 @@ def cmd_compose(args, progress_override=None):
 
     # Connect to Ableton
     session = Session()
-    tools, _, live_history = make_tools(
+    tools, _, _, track_roles, palette_scenes = make_tools(
         session,
         min_clips=args.min_clips,
-        live_mode=args.live,
-        duration_minutes=args.duration,
-        sub_lm=sub_lm if args.live else None,
-        brief=brief,
         progress=state,
     )
 
@@ -440,12 +505,11 @@ def cmd_compose(args, progress_override=None):
             }
         )
     finally:
-        state.phase = "firing" if not args.live else "exporting"
+        state.phase = "firing"
 
-    # Palette mode: auto-fire scenes sequentially
-    if not args.live and prediction and recording:
+    # Auto-fire scenes sequentially (palette plays first, always)
+    if prediction and recording:
         try:
-            state.phase = "firing"
             num_scenes = session.api.song.get("num_scenes")
             bpm_val = float(session.api.song.get("tempo"))
             bar_sec = 4 * 60.0 / bpm_val
@@ -458,6 +522,25 @@ def cmd_compose(args, progress_override=None):
                 time.sleep(args.bars_per_scene * bar_sec)
         except Exception as e:
             print(f"  [FIRE] Error during scene auto-fire: {e}")
+
+    # Live mode: evolution overlay on top of the palette
+    evolution_history = []
+    if args.live and prediction:
+        from .evolve import LiveEvolver
+
+        state.phase = "evolving"
+        evolver = LiveEvolver(
+            session,
+            sub_lm,
+            brief,
+            track_roles,
+            max(len(palette_scenes), 1),
+            args.duration,
+        )
+        evolver.initialize_from_palette(palette_scenes)
+        evolver.start_time = time.time()
+        _run_evolution_loop(evolver, session, args.bars_per_scene, state)
+        evolution_history = evolver.history
 
     # Stop recording, get WAV
     if recording:
@@ -510,7 +593,7 @@ def cmd_compose(args, progress_override=None):
         },
         "wav_path": wav_path,
         "trajectory": trajectory,
-        "live_history": live_history or [],
+        "live_history": evolution_history or [],
         "analysis": analysis,
     }
 

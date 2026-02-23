@@ -11,7 +11,7 @@
 ## Two Modes
 
 - **Palette mode** (default): builds a session grid of looping clips organized by scene/energy. The human DJ fires scenes to perform.
-- **Live mode** (`--live`): composes in real time while music plays. The RLM calls `compose_next()` with creative direction, a sub-LM makes all musical decisions, clips are written and fired automatically.
+- **Live mode** (`--live`): builds a palette first, then evolves it in real time. A sub-LM makes musical decisions while the human can type creative directions at any time. Scenes are overwritten and fired automatically.
 
 ## Why RLMs?
 
@@ -74,7 +74,7 @@ cp .env.example .env  # add your API keys
 # Palette mode — builds session grid, auto-fires scenes, exports WAV, analyzes
 bergain "Dark Berlin techno in F minor, 130 BPM"
 
-# Live mode — real-time composition with sub-LM creative decisions
+# Live mode — builds palette, then evolves in real time (type directions or let it auto-evolve)
 bergain --live --duration 10 "Evolving ambient in F minor"
 
 # Dry run — print config without connecting to Ableton
@@ -93,11 +93,11 @@ bergain-browse search "909"
 |------|-------------|---------|
 | `--live` | Live composition mode | off (palette) |
 | `--duration N` | Target duration in minutes (live mode) | 60 |
-| `--model` | Primary LM (LiteLLM string) | `$BERGAIN_MODEL` or `openrouter/openai/gpt-5` |
+| `--model` | Primary LM (LiteLLM string) | `$BERGAIN_MODEL` or `openrouter/google/gemini-3-flash-preview` |
 | `--sub-model` | Sub-LM for creative queries | same as `--model` |
-| `--max-iterations` | Max REPL iterations | 30 (palette) / 60 (live) |
-| `--max-llm-calls` | Max llm_query() calls | 40 (palette) / 60 (live) |
-| `--min-clips` | Minimum clips before SUBMIT | 6 (palette) / 3 (live) |
+| `--max-iterations` | Max REPL iterations | 30 |
+| `--max-llm-calls` | Max llm_query() calls | 40 |
+| `--min-clips` | Minimum clips before SUBMIT | 6 |
 | `--bars-per-scene` | Bars per scene for palette auto-fire | 16 |
 | `--skip-export` | Skip audio recording/export | off |
 | `--analyze` | Run Modal aesthetics analysis | off |
@@ -131,7 +131,8 @@ uvx modal deploy aesthetics/app.py
 
 ```
 bergain/cli.py          Unified CLI entry point
-bergain/compose.py      DSPy RLM signatures (Compose, LiveCompose)
+bergain/compose.py      DSPy RLM signature (Compose)
+bergain/evolve.py       Live evolution engine (LiveEvolver)
 bergain/tools.py        Tool closures over Session + milestone tracking
 bergain/progress.py     Rich progress display (ProgressState + ProgressDisplay)
 bergain/session.py      High-level API: tracks, clips, mix, recording
