@@ -168,13 +168,13 @@ class LaunchScreen(Screen):
             tempo = s.get("tempo", "?")
             tracks = len(s.get("tracks", []))
             session.close()
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self._update_osc_status,
                 f"Ableton: Connected -- {tempo} BPM, {tracks} tracks",
                 True,
             )
         except Exception as e:
-            self.call_from_thread(
+            self.app.call_from_thread(
                 self._update_osc_status,
                 f"Ableton: Not connected -- {e}",
                 False,
@@ -286,11 +286,15 @@ class ComposeScreen(Screen):
         ("q", "request_abort", "Abort"),
     ]
 
+    _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
     def __init__(self, config: dict) -> None:
         super().__init__()
         self.config = config
         self._state: ProgressState | None = None
         self._stream_cursor = 0
+        self._spinner_idx = 0
+        self._done_rendered = False
 
     def compose(self) -> ComposeResult:
         mode = "LIVE" if self.config.get("live") else "PALETTE"
@@ -307,7 +311,7 @@ class ComposeScreen(Screen):
 
     def on_mount(self) -> None:
         self._run_compose()
-        self.set_interval(0.5, self._refresh_display)
+        self.set_interval(0.2, self._refresh_display)
 
     @work(thread=True, exclusive=True)
     def _run_compose(self) -> None:
@@ -353,10 +357,19 @@ class ComposeScreen(Screen):
                 }
             )
         except Exception as e:
+            import traceback
+
             state.stream.append(
                 {
                     "type": "error",
                     "content": f"Compose error: {e}",
+                    "timestamp": _time.time(),
+                }
+            )
+            state.stream.append(
+                {
+                    "type": "error",
+                    "content": traceback.format_exc(),
                     "timestamp": _time.time(),
                 }
             )
@@ -370,39 +383,57 @@ class ComposeScreen(Screen):
 
         s = self._state
 
-        # Update header
+        # Update header with spinner
         mode = "LIVE" if s.live else "PALETTE"
         time_str = ""
         if s.start_time:
             elapsed = (_time.time() - s.start_time) / 60.0
             if s.live and s.duration:
-                time_str = f" -- {elapsed:.1f}/{s.duration} min"
+                time_str = f" {elapsed:.1f}/{s.duration} min"
             else:
-                time_str = f" -- {elapsed:.1f} min"
+                time_str = f" {elapsed:.1f} min"
 
         tok_str = ""
         if s.llm_tokens >= 1_000_000:
-            tok_str = f"{s.llm_tokens / 1_000_000:.1f}M"
+            tok_str = f"{s.llm_tokens / 1_000_000:.1f}M tok"
         elif s.llm_tokens >= 1_000:
-            tok_str = f"{s.llm_tokens / 1_000:.1f}k"
+            tok_str = f"{s.llm_tokens / 1_000:.1f}k tok"
         elif s.llm_tokens > 0:
-            tok_str = str(s.llm_tokens)
+            tok_str = f"{s.llm_tokens} tok"
 
-        calls_str = f" -- {s.llm_calls} calls" if s.llm_calls else ""
-        tok_part = f", {tok_str} tok" if tok_str else ""
-        pause_str = " [PAUSED]" if s.paused else ""
+        stats = " | ".join(
+            p
+            for p in [
+                f"{s.llm_calls} calls" if s.llm_calls else "",
+                tok_str,
+                time_str.strip(),
+            ]
+            if p
+        )
+
+        phase = s.phase
+        if s.paused:
+            phase = "PAUSED"
+        done = phase == "done"
+
+        if done:
+            spinner = "✓"
+        else:
+            spinner = self._SPINNER[self._spinner_idx % len(self._SPINNER)]
+            self._spinner_idx += 1
 
         header = self.query_one("#compose-header", Static)
-        header.update(
-            f"bergain -- {mode}{time_str}{calls_str}{tok_part} -- {s.phase}{pause_str}"
-        )
+        stats_part = f"  {stats}" if stats else ""
+        header.update(f" {spinner} {mode} | {phase}{stats_part}")
 
         # Append new stream entries
         stream_log = self.query_one("#stream", RichLog)
         new_entries = s.stream[self._stream_cursor :]
         for entry in new_entries:
             etype = entry.get("type", "")
-            content = entry.get("content", "")
+            raw = entry.get("content", "")
+            # Escape Rich markup characters in content
+            content = raw.replace("[", "\\[")
 
             if etype == "step":
                 stream_log.write(f"[bold cyan]{content}[/bold cyan]")
@@ -412,9 +443,9 @@ class ComposeScreen(Screen):
             elif etype == "result":
                 stream_log.write(f"[green]  -> {content}[/green]")
             elif etype == "guardrail":
-                stream_log.write(f"[red]  ⚡ {content}[/red]")
+                stream_log.write(f"[red]  {content}[/red]")
             elif etype == "steer":
-                stream_log.write(f"[bold magenta]  ✦ STEER: {content}[/bold magenta]")
+                stream_log.write(f"[bold magenta]  STEER: {content}[/bold magenta]")
             elif etype == "error":
                 stream_log.write(f"[bold red]  ERROR: {content}[/bold red]")
             else:
@@ -440,6 +471,34 @@ class ComposeScreen(Screen):
         status = self.query_one("#status-bar", Static)
         status.update(f"{spark}{energy_range}  {mile}")
 
+        # Render done summary once
+        if s.phase == "done" and not self._done_rendered:
+            self._done_rendered = True
+            elapsed_str = ""
+            if s.start_time:
+                mins = (_time.time() - s.start_time) / 60.0
+                elapsed_str = f"{mins:.1f} min"
+
+            tok_str = ""
+            if s.llm_tokens >= 1_000:
+                tok_str = f"{s.llm_tokens / 1_000:.1f}k"
+            elif s.llm_tokens > 0:
+                tok_str = str(s.llm_tokens)
+
+            parts = ["", "─" * 40, "  DONE"]
+            if elapsed_str:
+                parts.append(f"  Time:   {elapsed_str}")
+            parts.append(f"  Calls:  {s.llm_calls}")
+            if tok_str:
+                parts.append(f"  Tokens: {tok_str}")
+            parts.append(f"  Clips:  {s.clips_created}")
+            parts.append("")
+            parts.append("  Press q to exit")
+            parts.append("─" * 40)
+
+            for line in parts:
+                stream_log.write(f"[bold green]{line}[/bold green]")
+
     def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle steer input submission."""
         if event.input.id == "steer" and self._state:
@@ -457,6 +516,9 @@ class ComposeScreen(Screen):
 
     def action_request_abort(self) -> None:
         if self._state:
+            if self._state.phase == "done":
+                self.app.exit()
+                return
             self._state.abort = True
             stream_log = self.query_one("#stream", RichLog)
             stream_log.write("[bold red] ABORTING... [/bold red]")

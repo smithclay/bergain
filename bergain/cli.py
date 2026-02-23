@@ -423,8 +423,22 @@ def cmd_compose(args, progress_override=None):
         prediction = composer(brief=brief)
     except KeyboardInterrupt:
         print("\n  Interrupted — stopping playback...")
+        state.stream.append(
+            {
+                "type": "step",
+                "content": "Interrupted by user.",
+                "timestamp": time.time(),
+            }
+        )
     except Exception as e:
         print(f"\n  Compose error: {e}")
+        state.stream.append(
+            {
+                "type": "error",
+                "content": f"Compose error: {e}",
+                "timestamp": time.time(),
+            }
+        )
     finally:
         state.phase = "firing" if not args.live else "exporting"
 
