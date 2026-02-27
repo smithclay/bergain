@@ -342,6 +342,7 @@ class ComposeScreen(Screen):
             bars_per_scene=16,
             no_progress=True,
             output_dir="./output/compose/",
+            optimized=None,
         )
 
         try:
